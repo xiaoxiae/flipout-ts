@@ -9,6 +9,7 @@
 
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
 
 import {
   SurfaceMesh,
@@ -56,6 +57,7 @@ interface TeapotJson {
 }
 
 let teapotMesh: THREE.Mesh | null = null;
+let wireframeOverlay: THREE.LineSegments | null = null;
 let surfaceMesh: SurfaceMesh | null = null;
 let surfacePositions: [number, number, number][] | null = null;
 /**
@@ -77,6 +79,12 @@ const teapotMaterial = new THREE.MeshStandardMaterial({
   roughness: 0.55,
   metalness: 0.05,
   flatShading: false,
+});
+
+const wireframeMaterial = new THREE.LineBasicMaterial({
+  color: 0x1a1a22,
+  transparent: true,
+  opacity: 0.55,
 });
 
 async function loadMesh(name: string): Promise<void> {
@@ -107,12 +115,31 @@ async function loadMesh(name: string): Promise<void> {
   geom.computeVertexNormals();
   geom.computeBoundingBox();
 
-  // Tear down the previous mesh + any markers/path before swapping.
+  installGeometry(geom);
+}
+
+/**
+ * Take a populated `THREE.BufferGeometry` and install it as the active
+ * mesh: replace any existing mesh, re-frame the camera, build the
+ * flipout-ts `SurfaceMesh` + face-lookup, refresh wireframe overlay if
+ * shown. Used by both the bundled-asset path (`loadMesh`) and the
+ * user-OBJ-import path (`loadObjFile`).
+ */
+function installGeometry(geom: THREE.BufferGeometry): void {
+  // Tear down previous mesh + markers/path before swapping.
   clearAll();
   if (teapotMesh !== null) {
     scene.remove(teapotMesh);
     teapotMesh.geometry.dispose();
+    teapotMesh = null;
   }
+  if (wireframeOverlay !== null) {
+    scene.remove(wireframeOverlay);
+    wireframeOverlay.geometry.dispose();
+    wireframeOverlay = null;
+  }
+
+  if (geom.boundingBox === null) geom.computeBoundingBox();
 
   teapotMesh = new THREE.Mesh(geom, teapotMaterial);
   scene.add(teapotMesh);
@@ -151,6 +178,60 @@ async function loadMesh(name: string): Promise<void> {
     const c = it.next().value as number;
     triangleKeyToFaceIndex.set(triKey(a, b, c), f);
   }
+
+  applyWireframeToggle();
+}
+
+/**
+ * Add or remove a `LineSegments` wireframe overlay over the active mesh
+ * to match `wireframeChk.checked`. The overlay sits on top of the solid
+ * surface (no depth conflict for clicks because the raycaster targets
+ * the underlying mesh, not the lines).
+ */
+function applyWireframeToggle(): void {
+  if (teapotMesh === null) return;
+  const want = wireframeChk?.checked ?? false;
+  if (want && wireframeOverlay === null) {
+    const wf = new THREE.WireframeGeometry(teapotMesh.geometry);
+    wireframeOverlay = new THREE.LineSegments(wf, wireframeMaterial);
+    wireframeOverlay.renderOrder = 0.5;
+    scene.add(wireframeOverlay);
+  } else if (!want && wireframeOverlay !== null) {
+    scene.remove(wireframeOverlay);
+    wireframeOverlay.geometry.dispose();
+    wireframeOverlay = null;
+  }
+}
+
+/**
+ * Parse a user-supplied OBJ file's text and install it. Uses Three.js's
+ * `OBJLoader` to handle the parsing, then runs through the same
+ * `meshFromBufferGeometry` welding pipeline as the bundled assets — so
+ * non-indexed OBJ output is welded to a manifold mesh before flipout-ts
+ * sees it. Throws on non-manifold input (FlipOut requires a manifold
+ * triangle mesh); the caller surfaces the error to the user.
+ */
+function loadObjText(text: string, fileName: string): void {
+  const loader = new OBJLoader();
+  const group = loader.parse(text);
+  let firstMesh: THREE.Mesh | null = null;
+  group.traverse((obj) => {
+    if (firstMesh === null && (obj as THREE.Mesh).isMesh) {
+      firstMesh = obj as THREE.Mesh;
+    }
+  });
+  if (firstMesh === null) {
+    throw new Error(`OBJ "${fileName}" contains no mesh data.`);
+  }
+  const geom = (firstMesh as THREE.Mesh).geometry as THREE.BufferGeometry;
+  // OBJLoader produces a non-indexed BufferGeometry; meshFromBufferGeometry
+  // welds it. Make sure we have a position attribute.
+  if (geom.getAttribute('position') === undefined) {
+    throw new Error(`OBJ "${fileName}" has no position attribute.`);
+  }
+  geom.computeVertexNormals();
+  geom.computeBoundingBox();
+  installGeometry(geom);
 }
 
 // ---------------------------------------------------------------------------
@@ -167,6 +248,52 @@ let dstWorld: [number, number, number] | null = null;
 const statusEl = document.getElementById('status') as HTMLParagraphElement;
 const resetBtn = document.getElementById('reset') as HTMLButtonElement;
 const meshSel = document.getElementById('mesh') as HTMLSelectElement;
+const objButton = document.getElementById('obj-button') as HTMLButtonElement;
+const objInput = document.getElementById('obj-input') as HTMLInputElement;
+const wireframeChk = document.getElementById('wireframe') as HTMLInputElement;
+const pathPointsChk = document.getElementById('path-points') as HTMLInputElement;
+const animateBtn = document.getElementById('animate') as HTMLButtonElement;
+
+// Animation state. `lastResultIters` is set to `result.iterations` after
+// every successful runFlipOut; the Animate button uses it as the upper
+// bound. `animationToken` is bumped on cancel (reset / new path) so a
+// running animation can detect interruption and bail.
+let lastResultIters: number | null = null;
+let lastResultLength: number | null = null;
+let animationToken = 0;
+const ANIMATE_STEP_MS = 120;
+// Each animated step's line stays in the scene as a ghost, fading out
+// linearly over the next GHOST_FADE_STEPS frames so the eye can see the
+// transformation as a continuous trail rather than a discrete jump.
+// Ghosts are drawn in a muted color at lower starting opacity so the
+// active (most recent) line stands out clearly above the trail.
+const ACTIVE_LINE_COLOR = 0xff5577;
+const GHOST_LINE_COLOR = 0xa46676;
+const GHOST_INITIAL_OPACITY = 0.75;
+const GHOST_FADE_STEPS = 8;
+const ghostLines: { line: THREE.Line; mat: THREE.LineBasicMaterial }[] = [];
+
+function disposeAllGhosts(): void {
+  for (const g of ghostLines) {
+    scene.remove(g.line);
+    g.line.geometry.dispose();
+    g.mat.dispose();
+  }
+  ghostLines.length = 0;
+}
+
+/**
+ * Switch a `THREE.Line` from the active style (bright color, opacity 1)
+ * to the ghost style (muted color, GHOST_INITIAL_OPACITY) so it can fade
+ * out gracefully behind the new active line.
+ */
+function demoteToGhost(line: THREE.Line): void {
+  const mat = line.material as THREE.LineBasicMaterial;
+  mat.color.setHex(GHOST_LINE_COLOR);
+  mat.transparent = true;
+  mat.opacity = GHOST_INITIAL_OPACITY;
+  mat.needsUpdate = true;
+}
 
 meshSel.addEventListener('change', () => {
   void loadMesh(meshSel.value).catch((err: unknown) => {
@@ -174,6 +301,181 @@ meshSel.addEventListener('change', () => {
     console.error(err);
   });
 });
+
+objButton.addEventListener('click', () => {
+  objInput.click();
+});
+
+objInput.addEventListener('change', () => {
+  const file = objInput.files?.[0];
+  if (file === undefined) return;
+  setStatus(`Loading ${file.name}...`);
+  file
+    .text()
+    .then((text) => {
+      loadObjText(text, file.name);
+      setStatus(`Loaded ${file.name}. Click to set source.`);
+    })
+    .catch((err: unknown) => {
+      setStatus(`Failed to load ${file.name}: ${err instanceof Error ? err.message : String(err)}`);
+      console.error(err);
+    })
+    .finally(() => {
+      // Reset so the same file can be re-selected.
+      objInput.value = '';
+    });
+});
+
+wireframeChk.addEventListener('change', () => {
+  applyWireframeToggle();
+});
+
+pathPointsChk.addEventListener('change', () => {
+  if (pathPoints !== null) pathPoints.visible = pathPointsChk.checked;
+});
+
+animateBtn.addEventListener('click', () => {
+  void animateIterations();
+});
+
+/**
+ * Re-run flipOutPathFromSurfacePoints with maxIterations=0,1,...,N
+ * (where N is the iteration count of the current finalized path) and
+ * step through the resulting polylines. The algorithm is deterministic
+ * given a fresh intrinsic, so each k produces the same polyline as the
+ * first k flips of the actual run.
+ *
+ * Cancelable via `animationToken`: any reset or new path bumps the
+ * token and the running loop bails on its next iteration check.
+ */
+async function animateIterations(): Promise<void> {
+  if (
+    surfaceMesh === null ||
+    surfacePositions === null ||
+    srcPoint === null ||
+    dstPoint === null ||
+    lastResultIters === null ||
+    pathLine === null ||
+    pathPoints === null
+  ) {
+    return;
+  }
+  const finalIters = lastResultIters;
+  const token = ++animationToken;
+  setControlsEnabled(false);
+
+  // Demote the existing finalized line to a ghost (muted color, lower
+  // opacity) so it fades out as step 0 (the Dijkstra path) takes over.
+  demoteToGhost(pathLine);
+  ghostLines.push({
+    line: pathLine,
+    mat: pathLine.material as THREE.LineBasicMaterial,
+  });
+  pathLine = null;
+
+  const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+  for (let k = 0; k <= finalIters; k++) {
+    if (token !== animationToken) return;
+    let result;
+    try {
+      const g = new VertexPositionGeometry(surfaceMesh, surfacePositions);
+      const intr = new SignpostIntrinsicTriangulation(g);
+      result = flipOutPathFromSurfacePoints(intr, srcPoint, dstPoint, {
+        maxIterations: k,
+      });
+    } catch (err) {
+      setStatus(
+        `Animation aborted at step ${k}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      setControlsEnabled(true);
+      return;
+    }
+    if (token !== animationToken) return;
+
+    // Demote the previously-active line into the ghost list (muted
+    // color, lower starting opacity), then fade existing ghosts.
+    if (pathLine !== null) {
+      demoteToGhost(pathLine);
+      ghostLines.push({
+        line: pathLine,
+        mat: pathLine.material as THREE.LineBasicMaterial,
+      });
+      pathLine = null;
+    }
+    for (let i = ghostLines.length - 1; i >= 0; i--) {
+      const g = ghostLines[i]!;
+      // Skip the just-demoted one (already at GHOST_INITIAL_OPACITY); only
+      // decay older ghosts. We detect by opacity being already higher than
+      // its post-decay value of GHOST_INITIAL_OPACITY - 1/N.
+      // Simpler: always decay; entries pushed this frame just got reset
+      // to GHOST_INITIAL_OPACITY *after* this loop runs at the next step.
+      g.mat.opacity = Math.max(0, g.mat.opacity - GHOST_INITIAL_OPACITY / GHOST_FADE_STEPS);
+      if (g.mat.opacity <= 0.001) {
+        scene.remove(g.line);
+        g.line.geometry.dispose();
+        g.mat.dispose();
+        ghostLines.splice(i, 1);
+      }
+    }
+
+    // Build the new step's line at full opacity, bright color — it's the
+    // active path. It only becomes a ghost when the next step demotes it.
+    const newLineGeom = pathToBufferGeometry(result.polyline);
+    const newLineMat = new THREE.LineBasicMaterial({
+      color: ACTIVE_LINE_COLOR,
+      depthTest: false,
+      transparent: true,
+      opacity: 1.0,
+      linewidth: 2,
+    });
+    const newLine = new THREE.Line(newLineGeom, newLineMat);
+    newLine.renderOrder = 1;
+    scene.add(newLine);
+    pathLine = newLine;
+
+    // Path points still swap instantly each step (a fading-points trail
+    // would crowd the visual; the line ghost trail is the main effect).
+    if (pathPoints !== null) {
+      const flat = new Float32Array(result.polyline.length * 3);
+      for (let i = 0; i < result.polyline.length; i++) {
+        flat[i * 3 + 0] = result.polyline[i]![0];
+        flat[i * 3 + 1] = result.polyline[i]![1];
+        flat[i * 3 + 2] = result.polyline[i]![2];
+      }
+      const newPtsGeom = new THREE.BufferGeometry();
+      newPtsGeom.setAttribute('position', new THREE.BufferAttribute(flat, 3));
+      pathPoints.geometry.dispose();
+      pathPoints.geometry = newPtsGeom;
+    }
+
+    setStatus(
+      `Animating step ${k} / ${finalIters} — length=${result.length.toFixed(4)}`,
+    );
+
+    await sleep(ANIMATE_STEP_MS);
+  }
+  if (token !== animationToken) return;
+
+  // Animation done: pathLine already holds the final-iteration line at
+  // full opacity / active color. Just clear the trailing ghosts.
+  disposeAllGhosts();
+
+  setControlsEnabled(true);
+  if (lastResultLength !== null) {
+    setStatus(
+      `Geodesic length: ${lastResultLength.toFixed(4)} (${finalIters} iters, ✓ converged). Click to reset.`,
+    );
+  }
+}
+
+function setControlsEnabled(enabled: boolean): void {
+  meshSel.disabled = !enabled;
+  objButton.disabled = !enabled;
+  // Reset stays enabled so the user can cancel mid-animation.
+  // animateBtn is special: only enabled when there's a path AND not animating.
+  animateBtn.disabled = !enabled || lastResultIters === null;
+}
 
 function setStatus(msg: string): void {
   statusEl.textContent = msg;
@@ -186,6 +488,7 @@ function setStatus(msg: string): void {
 let srcMarker: THREE.Mesh | null = null;
 let dstMarker: THREE.Mesh | null = null;
 let pathLine: THREE.Line | null = null;
+let pathPoints: THREE.Points | null = null;
 
 function makeMarker(color: number): THREE.Mesh {
   const geom = new THREE.SphereGeometry(bboxDiag * 0.005, 16, 16);
@@ -209,17 +512,27 @@ function disposeObject3D(obj: THREE.Object3D | null): void {
 }
 
 function clearAll(): void {
+  // Cancel any running animation and re-enable controls.
+  animationToken++;
+  disposeAllGhosts();
   disposeObject3D(srcMarker);
   disposeObject3D(dstMarker);
   disposeObject3D(pathLine);
+  disposeObject3D(pathPoints);
   srcMarker = null;
   dstMarker = null;
   pathLine = null;
+  pathPoints = null;
   srcPoint = null;
   dstPoint = null;
   srcWorld = null;
   dstWorld = null;
+  lastResultIters = null;
+  lastResultLength = null;
   state = 'idle';
+  meshSel.disabled = false;
+  objButton.disabled = false;
+  animateBtn.disabled = true;
   setStatus('Click to set source.');
 }
 
@@ -412,12 +725,15 @@ function runFlipOut(): void {
   setStatus(`Computing geodesic ${describePoint(srcPoint)} -> ${describePoint(dstPoint)}...`);
 
   let result;
+  let computeMs = 0;
   try {
     // Rebuild intrinsic triangulation per click-pair (insertions + flips
     // mutate it in place, so reuse would corrupt subsequent queries).
+    const t0 = performance.now();
     const geom = new VertexPositionGeometry(surfaceMesh, surfacePositions);
     const intrinsic = new SignpostIntrinsicTriangulation(geom);
     result = flipOutPathFromSurfacePoints(intrinsic, srcPoint, dstPoint);
+    computeMs = performance.now() - t0;
   } catch (err) {
     setStatus(`Error: ${err instanceof Error ? err.message : String(err)}`);
     return;
@@ -433,13 +749,40 @@ function runFlipOut(): void {
   pathLine.renderOrder = 1;
   scene.add(pathLine);
 
+  // Points along the polyline (one per face crossing). Visibility toggled
+  // by the "Path points" checkbox; built every run so toggling on later
+  // shows the right set without needing to recompute.
+  const pointsGeom = new THREE.BufferGeometry();
+  const flatPts = new Float32Array(result.polyline.length * 3);
+  for (let i = 0; i < result.polyline.length; i++) {
+    flatPts[i * 3 + 0] = result.polyline[i]![0];
+    flatPts[i * 3 + 1] = result.polyline[i]![1];
+    flatPts[i * 3 + 2] = result.polyline[i]![2];
+  }
+  pointsGeom.setAttribute('position', new THREE.BufferAttribute(flatPts, 3));
+  const pointsMat = new THREE.PointsMaterial({
+    color: 0xffd060,
+    size: bboxDiag * 0.008,
+    sizeAttenuation: true,
+    depthTest: false,
+  });
+  pathPoints = new THREE.Points(pointsGeom, pointsMat);
+  pathPoints.renderOrder = 2;
+  pathPoints.visible = pathPointsChk.checked;
+  scene.add(pathPoints);
+
   const lengthStr = result.length.toFixed(4);
   const conv = result.converged ? '✓ converged' : '✗ did not converge';
   void srcWorld;
   void dstWorld;
   setStatus(
-    `Geodesic length: ${lengthStr} (${result.iterations} iters, ${conv}). Click to reset.`,
+    `Geodesic length: ${lengthStr} (${result.iterations} iters, ${conv}, ${computeMs.toFixed(1)} ms). Click to reset.`,
   );
+
+  // Enable Animate now that we have a finalized path.
+  lastResultIters = result.iterations;
+  lastResultLength = result.length;
+  animateBtn.disabled = false;
 }
 
 // ---------------------------------------------------------------------------

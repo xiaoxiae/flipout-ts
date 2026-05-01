@@ -58,7 +58,9 @@
         pointer-events: auto;
       }
       #reset,
-      #mesh {
+      #mesh,
+      #obj-button,
+      #animate {
         padding: 6px 12px;
         font-size: 13px;
         background: #2c2c38;
@@ -69,11 +71,49 @@
         font-family: inherit;
       }
       #reset:hover,
-      #mesh:hover {
+      #mesh:hover,
+      #obj-button:hover,
+      #animate:hover:not(:disabled) {
         background: #3a3a4a;
       }
-      #reset:active {
+      #reset:active,
+      #obj-button:active,
+      #animate:active:not(:disabled) {
         background: #2c2c38;
+      }
+      #animate:disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
+      }
+      #obj-input {
+        display: none;
+      }
+      #wireframe-row {
+        margin-top: 6px;
+        display: flex;
+        gap: 6px;
+        align-items: center;
+        font-size: 13px;
+        pointer-events: auto;
+      }
+      #footer {
+        position: fixed;
+        bottom: 12px;
+        right: 16px;
+        font-size: 12px;
+        line-height: 1.5;
+        opacity: 0.55;
+        text-align: right;
+        z-index: 10;
+      }
+      #footer a {
+        color: #cfd0e2;
+        text-decoration: none;
+        border-bottom: 1px dotted #6b6c80;
+      }
+      #footer a:hover {
+        opacity: 1;
+        color: #ffffff;
       }
     </style>
   </head>
@@ -89,9 +129,24 @@
           <option value="cube">Cube (8 V)</option>
           <option value="grid">Flat grid (16 V)</option>
         </select>
+        <button id="obj-button" type="button">Load OBJ...</button>
+        <input id="obj-input" type="file" accept=".obj" />
+        <button id="animate" type="button" disabled>Animate</button>
         <button id="reset">Reset</button>
       </div>
+      <div id="wireframe-row">
+        <input id="wireframe" type="checkbox" />
+        <label for="wireframe">Wireframe overlay</label>
+        &nbsp;&nbsp;
+        <input id="path-points" type="checkbox" />
+        <label for="path-points">Path points</label>
+      </div>
       <p id="subtitle">Drag to orbit, scroll to zoom.</p>
+    </div>
+    <div id="footer">
+      made by <a href="https://slama.dev">Tomáš Slama</a> &middot;
+      based on <a href="https://nmwsharp.com/media/papers/flip-geodesics/flip_geodesics.pdf">Sharp &amp; Crane 2020</a><br />
+      <a href="https://github.com/xiaoxiae/flipout-ts">github.com/xiaoxiae/flipout-ts</a>
     </div>
     <script type="module" src="/src/main.ts"></script>
   </body>
