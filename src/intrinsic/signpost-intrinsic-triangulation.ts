@@ -641,6 +641,75 @@ export class SignpostIntrinsicTriangulation {
   }
 
   /**
+   * Polyline variant of {@link traceFromVertex}. Returns the **sequence of
+   * 3D points** the trace passes through on the *input* mesh: starting at
+   * the tail vertex, then a point on every face boundary crossing, ending
+   * at the trace's final point. Used by L4's `extractPolyline` to render
+   * an intrinsic geodesic edge as a 3D polyline on the input mesh.
+   *
+   * Mirrors gc's `traceIntrinsicHalfedgeAlongInput` (specifically its
+   * `options.includePath = true` branch which records every face crossing).
+   *
+   * NOTE: this is a minimal extension to L3 — same trace logic as
+   * `traceFromVertex`, but emits intermediate face-crossings instead of
+   * just the endpoint. Added here (rather than at L4) so the 2D-layout
+   * machinery and tolerance constants stay encapsulated.
+   */
+  tracePolylineFromVertex(v: number, tangentAngle: number, distance: number): Vec3[] {
+    const startPos = this.inputGeometry.position(v);
+    if (distance === 0) return [startPos];
+
+    const m = this.inputGeometry.mesh;
+    const angle2pi = modPositive(tangentAngle, 2 * Math.PI);
+    const sumTotal = this.vertexAngleSums[v]!;
+    const target = m.isBoundaryVertex(v) ? Math.PI : 2 * Math.PI;
+    const scale = target / sumTotal;
+
+    let cumulative = 0;
+    let chosenHe = -1;
+    let chosenStartAngle = 0;
+
+    const firstInterior = m.vertexHalfedge(v);
+    let curr = firstInterior;
+    const eps = 1e-10;
+    do {
+      if (m.face(curr) === INVALID_INDEX) break;
+      const cAngleRaw = this.inputGeometry.cornerAngle(curr);
+      const cAngle = cAngleRaw * scale;
+      const start = cumulative;
+      const end = cumulative + cAngle;
+      if (angle2pi >= start - eps && angle2pi < end - eps) {
+        chosenHe = curr;
+        chosenStartAngle = start;
+        break;
+      }
+      cumulative = end;
+      curr = m.twin(m.next(m.next(curr)));
+    } while (curr !== firstInterior);
+
+    if (chosenHe === -1) {
+      // Same fallback as `traceFromVertex`: clamp to the last wedge.
+      let last = firstInterior;
+      let lastCum = 0;
+      let runningCum = 0;
+      let scanCurr = firstInterior;
+      do {
+        if (m.face(scanCurr) === INVALID_INDEX) break;
+        last = scanCurr;
+        lastCum = runningCum;
+        const cAngle = this.inputGeometry.cornerAngle(scanCurr) * scale;
+        runningCum += cAngle;
+        scanCurr = m.twin(m.next(m.next(scanCurr)));
+      } while (scanCurr !== firstInterior);
+      chosenHe = last;
+      chosenStartAngle = lastCum;
+    }
+
+    const relRaw = (angle2pi - chosenStartAngle) / scale;
+    return this.tracePolylineInFaceFromVertexCorner(chosenHe, relRaw, distance);
+  }
+
+  /**
    * Trace from the tail-vertex corner of `startHe`, with a 2D direction in
    * `face(startHe)` defined by rotating `+x` (the unit vector along
    * `startHe`) by `relAngleRaw` CCW. Walk distance `distance` along the
@@ -888,6 +957,164 @@ export class SignpostIntrinsicTriangulation {
       vC,
     );
     return { position: pos, faceIndex: face, barycentric: baryCanonical };
+  }
+
+  /**
+   * Polyline variant of {@link traceInFaceFromVertexCorner}. Same walk
+   * (face-crossing 2D ray cast through the input mesh), but instead of
+   * returning the trace endpoint we record every 3D point we visit:
+   *
+   *   - the start corner of `startHe` (tail vertex of `startHe`),
+   *   - one point per face-boundary crossing (the 2D crossing point lifted
+   *     to 3D using the face's 2D layout),
+   *   - the final point inside the last face.
+   *
+   * Used only by `tracePolylineFromVertex`.
+   */
+  private tracePolylineInFaceFromVertexCorner(
+    startHe: number,
+    relAngleRaw: number,
+    distance: number,
+  ): Vec3[] {
+    const m = this.inputGeometry.mesh;
+
+    let face = m.face(startHe);
+    let heA = startHe;
+    let heB = m.next(heA);
+    let heC = m.next(heB);
+
+    let vA = m.vertex(heA);
+    let vB = m.vertex(heB);
+    let vC = m.vertex(heC);
+
+    let lAB = this.inputGeometry.halfedgeLength(heA);
+    let lBC = this.inputGeometry.halfedgeLength(heB);
+    let lCA = this.inputGeometry.halfedgeLength(heC);
+
+    let pA: Vec2 = [0, 0];
+    let pB: Vec2 = [lAB, 0];
+    let pC = layoutTriangleVertex(pA, pB, lBC, lCA);
+
+    let dir: Vec2 = fromAngle(relAngleRaw);
+    let p: Vec2 = [pA[0], pA[1]];
+    let remaining = distance;
+
+    // Output buffer: starts with the start vertex's 3D position.
+    const out: Vec3[] = [this.inputGeometry.position(vA)];
+
+    const maxIters = m.nFaces * 4 + 8;
+    for (let iter = 0; iter < maxIters; iter++) {
+      const endX = p[0] + dir[0] * remaining;
+      const endY = p[1] + dir[1] * remaining;
+
+      let bestT = Number.POSITIVE_INFINITY;
+      let crossEdgeIdx = -1;
+
+      const intersect = (s0: Vec2, s1: Vec2): number => {
+        const sx = s1[0] - s0[0];
+        const sy = s1[1] - s0[1];
+        const denom = -dir[0] * sy + sx * dir[1];
+        if (Math.abs(denom) < TRACE_DENOM_EPS) return Number.POSITIVE_INFINITY;
+        const rx = s0[0] - p[0];
+        const ry = s0[1] - p[1];
+        const t = (-rx * sy + ry * sx) / denom;
+        const u = (dir[0] * ry - dir[1] * rx) / denom;
+        if (t < TRACE_RAY_EPS) return Number.POSITIVE_INFINITY;
+        if (u < -TRACE_SEGMENT_EPS || u > 1 + TRACE_SEGMENT_EPS) return Number.POSITIVE_INFINITY;
+        return t;
+      };
+
+      const tAB = intersect(pA, pB);
+      const tBC = intersect(pB, pC);
+      const tCA = intersect(pC, pA);
+
+      if (tAB < bestT) {
+        bestT = tAB;
+        crossEdgeIdx = 0;
+      }
+      if (tBC < bestT) {
+        bestT = tBC;
+        crossEdgeIdx = 1;
+      }
+      if (tCA < bestT) {
+        bestT = tCA;
+        crossEdgeIdx = 2;
+      }
+
+      if (bestT >= remaining || crossEdgeIdx === -1) {
+        // Trace ends inside this face; lift to 3D and append.
+        const pEnd: Vec2 = [endX, endY];
+        const bary = this.baryInLayoutTriangle(pEnd, pA, pB, pC);
+        out.push(this.lift3DFromVertices(vA, vB, vC, bary));
+        return out;
+      }
+
+      // Edge crossing — lift and append, then step into neighbour face.
+      const xCross: Vec2 = [p[0] + dir[0] * bestT, p[1] + dir[1] * bestT];
+      const baryCross = this.baryInLayoutTriangle(xCross, pA, pB, pC);
+      out.push(this.lift3DFromVertices(vA, vB, vC, baryCross));
+
+      const newRemaining = remaining - bestT;
+      const crossHe = crossEdgeIdx === 0 ? heA : crossEdgeIdx === 1 ? heB : heC;
+      const twin = m.twin(crossHe);
+      if (m.face(twin) === INVALID_INDEX) {
+        // Hit the boundary — terminate at the crossing point we just appended.
+        return out;
+      }
+
+      const s0 = crossEdgeIdx === 0 ? pA : crossEdgeIdx === 1 ? pB : pC;
+      const s1 = crossEdgeIdx === 0 ? pB : crossEdgeIdx === 1 ? pC : pA;
+      const sLen = Math.hypot(s1[0] - s0[0], s1[1] - s0[1]);
+
+      const newFace = m.face(twin);
+      const newHeA = twin;
+      const newHeB = m.next(newHeA);
+      const newHeC = m.next(newHeB);
+      const lABn = this.inputGeometry.halfedgeLength(newHeA);
+      const lBCn = this.inputGeometry.halfedgeLength(newHeB);
+      const lCAn = this.inputGeometry.halfedgeLength(newHeC);
+      const newPA: Vec2 = [0, 0];
+      const newPB: Vec2 = [lABn, 0];
+      const newPC = layoutTriangleVertex(newPA, newPB, lBCn, lCAn);
+
+      const distFromS0 = Math.hypot(xCross[0] - s0[0], xCross[1] - s0[1]);
+      const u = sLen > 0 ? distFromS0 / sLen : 0;
+      const newP: Vec2 = [(1 - u) * lABn, 0];
+
+      const tox = (s1[0] - s0[0]) / sLen;
+      const toy = (s1[1] - s0[1]) / sLen;
+      const aDir = dir[0] * tox + dir[1] * toy;
+      const nDir = dir[0] * -toy + dir[1] * tox;
+      const newDirX = aDir * -1 + nDir * 0;
+      const newDirY = aDir * 0 + nDir * -1;
+      const dn = Math.hypot(newDirX, newDirY);
+      const newDir: Vec2 = dn > 0 ? [newDirX / dn, newDirY / dn] : [1, 0];
+
+      face = newFace;
+      heA = newHeA;
+      heB = newHeB;
+      heC = newHeC;
+      vA = m.vertex(heA);
+      vB = m.vertex(heB);
+      vC = m.vertex(heC);
+      lAB = lABn;
+      lBC = lBCn;
+      lCA = lCAn;
+      pA = newPA;
+      pB = newPB;
+      pC = newPC;
+      p = newP;
+      dir = newDir;
+      remaining = newRemaining;
+    }
+
+    // Iter cap: append best-effort endpoint. `face` tracks the current input
+    // face index for parity with `traceInFaceFromVertexCorner`; not part of
+    // the polyline output.
+    void face;
+    const bary = this.baryInLayoutTriangle(p, pA, pB, pC);
+    out.push(this.lift3DFromVertices(vA, vB, vC, bary));
+    return out;
   }
 
   // --------------------------------------------------------------------------

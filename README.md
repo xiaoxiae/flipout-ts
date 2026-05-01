@@ -17,7 +17,7 @@ The port is layered. Each layer ships with its own tests; later layers depend on
 | L1 | `src/mesh/` — `SurfaceMesh`, iteration, edge flip | ✅ done (129 tests) | `surface/surface_mesh.cpp`, `halfedge_mesh.cpp` |
 | L2 | `src/geometry/` — `VertexPositionGeometry` | ✅ done (73 tests) | `surface/vertex_position_geometry.cpp` |
 | L3 | `src/intrinsic/` — `SignpostIntrinsicTriangulation` | ✅ done (113 tests) | `surface/signpost_intrinsic_triangulation.cpp` |
-| L4 | `src/flipout/` — `FlipEdgeNetwork` (the algorithm) | TODO | `surface/flip_geodesics.cpp` |
+| L4 | `src/flipout/` — `FlipEdgeNetwork` (the algorithm) | ✅ done (110 tests) | `surface/flip_geodesics.cpp` |
 | L5 | `src/three/` — `THREE.BufferGeometry` adapter | ✅ done (35 tests) | new code |
 
 ## Test strategy
