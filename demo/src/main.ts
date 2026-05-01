@@ -14,10 +14,10 @@ import {
   SurfaceMesh,
   VertexPositionGeometry,
   SignpostIntrinsicTriangulation,
-} from '@chalkbag/flipout-ts';
-import type { SurfacePoint } from '@chalkbag/flipout-ts';
-import { flipOutPathFromSurfacePoints } from '@chalkbag/flipout-ts/flipout';
-import { meshFromBufferGeometry, pathToBufferGeometry } from '@chalkbag/flipout-ts/three';
+} from 'flipout-ts';
+import type { SurfacePoint } from 'flipout-ts';
+import { flipOutPathFromSurfacePoints } from 'flipout-ts/flipout';
+import { meshFromBufferGeometry, pathToBufferGeometry } from 'flipout-ts/three';
 
 // ---------------------------------------------------------------------------
 // Boot

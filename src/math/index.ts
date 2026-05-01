@@ -3,10 +3,15 @@
 // (`Vec2Ops`, `Vec3Ops`) since `add`/`sub`/etc. collide between vec2 and vec3.
 // Higher layers can import the type directly:
 //
-//   import type { Vec3 } from '@chalkbag/flipout-ts/math';
-//   import { Vec3Ops } from '@chalkbag/flipout-ts/math';
+//   import type { Vec3 } from 'flipout-ts/math';
+//   import { Vec3Ops } from 'flipout-ts/math';
 //
 // or pull individual functions from the per-module entry points.
+//
+// Ported from geometry-central's math utilities:
+//   include/geometrycentral/utilities/vector2.h
+//   include/geometrycentral/utilities/vector3.h
+//   include/geometrycentral/numerical/linear_algebra_utilities.h
 
 export type { Vec2 } from './vec2.js';
 export type { Vec3 } from './vec3.js';

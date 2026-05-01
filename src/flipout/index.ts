@@ -2,14 +2,14 @@
 // `FlipEdgeNetwork` (the algorithm) plus the high-level `flipOutPath`
 // convenience function and the `shortestEdgePath` Dijkstra helper.
 //
-// Ported from geometry-central:
+// Ported from geometry-central's flip-geodesics namespace:
 //   include/geometrycentral/surface/flip_geodesics.h
 //   src/surface/flip_geodesics.cpp
 //   src/surface/mesh_graph_algorithms.cpp::shortestEdgePath
 //
 // Higher consumers (tests, CLI) import via:
 //
-//   import { FlipEdgeNetwork, flipOutPath } from '@chalkbag/flipout-ts/flipout';
+//   import { FlipEdgeNetwork, flipOutPath } from 'flipout-ts/flipout';
 
 export {
   FlipEdgeNetwork,

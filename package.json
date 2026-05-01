@@ -1,8 +1,9 @@
 {
-  "name": "@chalkbag/flipout-ts",
-  "version": "0.0.0",
-  "private": true,
-  "description": "TypeScript port of FlipOut geodesic path computation (Sharp & Crane, SIGGRAPH 2020), based on geometry-central.",
+  "name": "flipout-ts",
+  "version": "0.1.0",
+  "description": "TypeScript port of FlipOut: fast geodesic paths on triangle meshes via edge flips (Sharp & Crane, SIGGRAPH Asia 2020). Built on geometry-central; works with Three.js.",
+  "author": "Tomáš Slama",
+  "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -21,6 +22,27 @@
     "LICENSE",
     "NOTICE",
     "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xiaoxiae/flipout-ts.git"
+  },
+  "homepage": "https://flipout.slama.dev",
+  "bugs": {
+    "url": "https://github.com/xiaoxiae/flipout-ts/issues"
+  },
+  "keywords": [
+    "geodesic",
+    "geodesic-path",
+    "geodesic-distance",
+    "mesh",
+    "triangle-mesh",
+    "intrinsic-triangulation",
+    "geometry-processing",
+    "geometry-central",
+    "flipout",
+    "edge-flip",
+    "three.js"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
