@@ -1,4 +1,4 @@
-// Bake demo mesh assets from `../flipout-ts/fixtures/*.json` into
+// Bake demo mesh assets from `../../fixtures/*.json` into
 // `public/meshes/<name>.json`. Each fixture stores a welded, manifold
 // mesh in its `mesh` field; we extract just that and drop the FlipOut
 // query/expected payloads. Run once during setup; the generated assets
@@ -9,7 +9,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const FIXTURES = resolve(__dirname, '../../flipout-ts/fixtures');
+const FIXTURES = resolve(__dirname, '../../fixtures');
 const OUT = resolve(__dirname, '../public/meshes');
 
 // [demo name, source fixture]. Several fixtures share the same mesh

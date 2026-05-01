@@ -12,9 +12,9 @@
     "lib": ["ES2022", "DOM"],
     "noEmit": true,
     "paths": {
-      "@chalkbag/flipout-ts/three": ["../flipout-ts/src/three/index.ts"],
-      "@chalkbag/flipout-ts/flipout": ["../flipout-ts/src/flipout/index.ts"],
-      "@chalkbag/flipout-ts": ["../flipout-ts/src/index.ts"]
+      "@chalkbag/flipout-ts/three": ["../src/three/index.ts"],
+      "@chalkbag/flipout-ts/flipout": ["../src/flipout/index.ts"],
+      "@chalkbag/flipout-ts": ["../src/index.ts"]
     }
   },
   "include": ["src", "vite.config.ts"]

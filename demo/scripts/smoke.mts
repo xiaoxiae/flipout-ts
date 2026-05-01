@@ -2,7 +2,7 @@
 //
 // Loads the *baked* `public/teapot.json`, runs `flipOutPath` on a hardcoded
 // (src, dst) pair, and asserts the resulting length matches the expected
-// length from `flipout-ts/fixtures/teapot-far.json`. This validates that
+// length from `fixtures/teapot-far.json`. This validates that
 // the alias resolution and end-to-end usage works at the Node level.
 //
 // The imports go through the same path aliases used by the Vite + tsc setup
@@ -12,14 +12,14 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { SurfaceMesh, VertexPositionGeometry, SignpostIntrinsicTriangulation } from '../../flipout-ts/src/index.js';
-import { flipOutPath, flipOutPathFromSurfacePoints } from '../../flipout-ts/src/flipout/index.js';
-import type { SurfacePoint } from '../../flipout-ts/src/index.js';
+import { SurfaceMesh, VertexPositionGeometry, SignpostIntrinsicTriangulation } from '../../src/index.js';
+import { flipOutPath, flipOutPathFromSurfacePoints } from '../../src/flipout/index.js';
+import type { SurfacePoint } from '../../src/index.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const TEAPOT_JSON = resolve(__dirname, '../public/meshes/teapot.json');
-const FIXTURE_JSON = resolve(__dirname, '../../flipout-ts/fixtures/teapot-far.json');
+const FIXTURE_JSON = resolve(__dirname, '../../fixtures/teapot-far.json');
 
 interface TeapotJson {
   vertices: [number, number, number][];
