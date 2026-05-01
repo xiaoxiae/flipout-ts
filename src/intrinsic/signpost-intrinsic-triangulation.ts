@@ -1189,6 +1189,219 @@ export class SignpostIntrinsicTriangulation {
   }
 
   /**
+   * Polyline tracer that starts at an arbitrary {@link SurfacePoint} on the
+   * input mesh, walks `dist` along the geodesic in tangent-space direction
+   * `tangentAngle`, and returns the 3D points it crosses (start, every face
+   * boundary it crosses, and the final endpoint).
+   *
+   * Mirrors gc's `traceGeodesic` (`trace_geodesic.cpp`), which dispatches
+   * by `SurfacePoint` kind to `traceGeodesic_fromVertex` /
+   * `traceGeodesic_fromEdge` / `traceGeodesic_fromFace`. We reuse our
+   * existing `tracePolylineFromVertex` for the vertex case, and lay out the
+   * incident face in 2D for the edge / face cases — using the same
+   * convention as gc's `vertexCoordinatesInTriangle`:
+   *
+   *   vertCoords[0] = (0, 0)                 // tail of face.halfedge()
+   *   vertCoords[1] = (|face.halfedge()|, 0) // tip of face.halfedge()
+   *   vertCoords[2] = layoutTriangleVertex(...)
+   *
+   * (i.e. the +x axis points along `face.halfedge()`).
+   *
+   * **Angle convention at face-interior starts.** When a vertex was inserted
+   * into face `f` via {@link insertVertex_face}, gc anchors its tangent
+   * frame so the *first* outgoing halfedge from the new vertex carries
+   * `signpostAngle = 0`, and that halfedge points from the new vertex
+   * toward the face's first-halfedge tail (corner 0). Therefore "0 radians"
+   * in the inserted-vertex tangent frame corresponds to the direction
+   * `(corner0 - newPCoord)` in the face's 2D frame. We add the offset
+   * `atan2(-newPCoord.y, -newPCoord.x)` to convert.
+   *
+   * For an edge-interior start, the chosen face is the one on the +y side
+   * of the trace direction (mirroring gc's `traceGeodesic_fromEdge`); the
+   * angle convention there is "0 radians" along the edge halfedge `+x`.
+   *
+   * @param start - vertex / edge / face point on the input mesh
+   * @param tangentAngle - direction in [0, 2π); rescaled vertex tangent
+   *   for vertex starts, face-frame angle (with the convention above) for
+   *   face / edge starts.
+   * @param dist - geodesic distance to walk (≥ 0)
+   */
+  tracePolylineFromSurfacePoint(
+    start: SurfacePoint,
+    tangentAngle: number,
+    dist: number,
+  ): Vec3[] {
+    const startPos = this.surfacePointPosition(start);
+    if (dist === 0) return [startPos];
+
+    if (start.kind === 'vertex') {
+      return this.tracePolylineFromVertex(start.vertex, tangentAngle, dist);
+    }
+
+    const m = this.inputGeometry.mesh;
+
+    // Determine the start face and the in-face barycentric / 2D position.
+    let face: number;
+    let baryInFace: [number, number, number];
+    if (start.kind === 'face') {
+      if (start.face < 0 || start.face >= m.nFaces) {
+        throw new RangeError(
+          `tracePolylineFromSurfacePoint: face ${start.face} out of range [0, ${m.nFaces})`,
+        );
+      }
+      face = start.face;
+      baryInFace = [start.bary[0], start.bary[1], start.bary[2]];
+    } else {
+      // 'edge'. Pick the face on the +y side of the trace dir, gc-style.
+      const heE = m.edgeHalfedge(start.edge);
+      const t01 = start.t;
+      // Lay out the face on each side and decide based on the y component.
+      const sinAngle = Math.sin(tangentAngle);
+      let chosenHe: number;
+      let edgeT: number;
+      if (sinAngle >= 0) {
+        // Positive y → use the face on heE's side. heE goes from corner 0 to
+        // corner 1 (i.e. along +x of its face's layout). The trace's "0
+        // radians" is along heE, so a positive-y direction goes into heE's
+        // face.
+        if (m.face(heE) === INVALID_INDEX) {
+          // The +y side is the boundary; fall back to the twin face.
+          chosenHe = m.twin(heE);
+          edgeT = 1 - t01;
+        } else {
+          chosenHe = heE;
+          edgeT = t01;
+        }
+      } else {
+        // Negative y → use the twin face. Edge t flips because halfedges
+        // run in opposite directions.
+        const twin = m.twin(heE);
+        if (m.face(twin) === INVALID_INDEX) {
+          chosenHe = heE;
+          edgeT = t01;
+        } else {
+          chosenHe = twin;
+          edgeT = 1 - t01;
+        }
+      }
+      // For the edge case we want the chosen face's first halfedge to be
+      // `chosenHe` so the layout convention (+x along face.halfedge())
+      // applies symmetrically. But the face's stored first halfedge may not
+      // be `chosenHe`. Compute the layout off `m.faceHalfedge(face)` (gc's
+      // convention) and place the start point on the segment of that
+      // layout corresponding to `chosenHe`.
+      face = m.face(chosenHe);
+      // Find which corner index of the face's CCW order corresponds to the
+      // tail of `chosenHe`, so we can compute barycentrics.
+      const h0 = m.faceHalfedge(face);
+      const h1 = m.next(h0);
+      const h2 = m.next(h1);
+      let b: [number, number, number];
+      // chosenHe goes from its tail to its tip. If it equals h0, the start
+      // sits on the h0 segment: bary = (1-edgeT) at corner(h0), edgeT at
+      // corner(h1). And similarly for h1, h2. Corner indices in
+      // (b0, b1, b2) line up with halfedge tails (h0, h1, h2).
+      if (chosenHe === h0) {
+        b = [1 - edgeT, edgeT, 0];
+      } else if (chosenHe === h1) {
+        b = [0, 1 - edgeT, edgeT];
+      } else if (chosenHe === h2) {
+        b = [edgeT, 0, 1 - edgeT];
+      } else {
+        throw new Error(
+          `tracePolylineFromSurfacePoint: edge halfedge ${chosenHe} not in face ${face}`,
+        );
+      }
+      baryInFace = b;
+    }
+
+    // Lay out the chosen face with its first halfedge along +x.
+    const heA = m.faceHalfedge(face);
+    const heB = m.next(heA);
+    const heC = m.next(heB);
+    const lAB = this.inputGeometry.halfedgeLength(heA);
+    const lBC = this.inputGeometry.halfedgeLength(heB);
+    const lCA = this.inputGeometry.halfedgeLength(heC);
+    const pA: Vec2 = [0, 0];
+    const pB: Vec2 = [lAB, 0];
+    const pC = layoutTriangleVertex(pA, pB, lBC, lCA);
+
+    const [b0, b1, b2] = baryInFace;
+    const p: Vec2 = [
+      b0 * pA[0] + b1 * pB[0] + b2 * pC[0],
+      b0 * pA[1] + b1 * pB[1] + b2 * pC[1],
+    ];
+
+    // Convert the trace direction.
+    let faceFrameAngle: number;
+    if (start.kind === 'face') {
+      // For an inserted face vertex, "0 radians" in its tangent frame
+      // points toward corner 0 (= origin) of the face's 2D layout. The
+      // direction "toward (0,0)" from `p` is `-p`; its angle is
+      // atan2(-p.y, -p.x).
+      const offset = Math.atan2(-p[1], -p[0]);
+      faceFrameAngle = offset + tangentAngle;
+    } else {
+      // 'edge'. "0 radians" in the inserted-edge-vertex frame points along
+      // the edge halfedge. We chose the face/orientation above so that
+      // the chosen halfedge runs in the +x direction of an edge layout
+      // where `p` sits on the bottom edge of the face. But we laid out the
+      // face using its `faceHalfedge`, not the chosen one. Re-derive the
+      // angle by computing the direction along `chosenHe` in the face's
+      // 2D frame and adding the user-supplied tangentAngle to its arg.
+      // That edge runs from `p_tail` to `p_tip` in the face frame — find
+      // those positions from the corner array.
+      // Simpler: an edge insertion's tangent frame "0" points along its
+      // halfedge. `chosenHe` runs from one corner to the next. Its
+      // direction in the face frame is (cornerTip - cornerTail).
+      const cornerPos = [pA, pB, pC];
+      let tailIdx = -1;
+      let tipIdx = -1;
+      // chosenHe was used above; recompute it to keep the closure tight.
+      const sinAngle = Math.sin(tangentAngle);
+      const heE = m.edgeHalfedge(start.edge);
+      let chosenHe: number;
+      if (sinAngle >= 0) {
+        chosenHe = m.face(heE) === INVALID_INDEX ? m.twin(heE) : heE;
+      } else {
+        const tw = m.twin(heE);
+        chosenHe = m.face(tw) === INVALID_INDEX ? heE : tw;
+      }
+      const h0 = m.faceHalfedge(face);
+      const h1 = m.next(h0);
+      const h2 = m.next(h1);
+      if (chosenHe === h0) {
+        tailIdx = 0;
+        tipIdx = 1;
+      } else if (chosenHe === h1) {
+        tailIdx = 1;
+        tipIdx = 2;
+      } else {
+        tailIdx = 2;
+        tipIdx = 0;
+      }
+      const tailP = cornerPos[tailIdx]!;
+      const tipP = cornerPos[tipIdx]!;
+      const baseAngle = Math.atan2(tipP[1] - tailP[1], tipP[0] - tailP[0]);
+      faceFrameAngle = baseAngle + tangentAngle;
+    }
+
+    const dir: Vec2 = fromAngle(faceFrameAngle);
+
+    return this.tracePolylineInFace2D(
+      face,
+      heA,
+      pA,
+      pB,
+      pC,
+      p,
+      dir,
+      dist,
+      startPos,
+    );
+  }
+
+  /**
    * Trace from the tail-vertex corner of `startHe`, with a 2D direction in
    * `face(startHe)` defined by rotating `+x` (the unit vector along
    * `startHe`) by `relAngleRaw` CCW. Walk distance `distance` along the
@@ -1448,7 +1661,9 @@ export class SignpostIntrinsicTriangulation {
    *     to 3D using the face's 2D layout),
    *   - the final point inside the last face.
    *
-   * Used only by `tracePolylineFromVertex`.
+   * Used only by `tracePolylineFromVertex`. Delegates to
+   * {@link tracePolylineInFace2D} after laying out the start face with the
+   * vertex corner at the origin.
    */
   private tracePolylineInFaceFromVertexCorner(
     startHe: number,
@@ -1457,8 +1672,67 @@ export class SignpostIntrinsicTriangulation {
   ): Vec3[] {
     const m = this.inputGeometry.mesh;
 
-    let face = m.face(startHe);
-    let heA = startHe;
+    const face = m.face(startHe);
+    const heA = startHe;
+    const heB = m.next(heA);
+    const heC = m.next(heB);
+
+    const lAB = this.inputGeometry.halfedgeLength(heA);
+    const lBC = this.inputGeometry.halfedgeLength(heB);
+    const lCA = this.inputGeometry.halfedgeLength(heC);
+
+    const pA: Vec2 = [0, 0];
+    const pB: Vec2 = [lAB, 0];
+    const pC = layoutTriangleVertex(pA, pB, lBC, lCA);
+
+    const dir: Vec2 = fromAngle(relAngleRaw);
+    // Start point is the corner at the tail of `startHe`, which is `pA`.
+    const startPoint: Vec2 = [pA[0], pA[1]];
+
+    // Initial output point is the 3D position of the corner vertex.
+    const startVertex3D = this.inputGeometry.position(m.vertex(heA));
+
+    return this.tracePolylineInFace2D(
+      face,
+      heA,
+      pA,
+      pB,
+      pC,
+      startPoint,
+      dir,
+      distance,
+      startVertex3D,
+    );
+  }
+
+  /**
+   * Inner polyline-trace driver. Walks a 2D ray across input-mesh faces,
+   * starting from a fully-prepared 2D state. Decoupled from the start kind
+   * so {@link tracePolylineInFaceFromVertexCorner} (vertex-corner start) and
+   * {@link tracePolylineFromSurfacePoint} (face/edge-interior start) can
+   * share the per-face-step logic.
+   *
+   * The face-transition logic is identical to gc's `traceInFaceFromEdge`
+   * (`trace_geodesic.cpp`): when the ray exits through an edge, the new
+   * face is laid out with its own first halfedge along +x, the entry point
+   * is computed via arc-length parameter `u` along the shared edge, and the
+   * direction is reflected through the (tangent, inward-perp) basis change.
+   */
+  private tracePolylineInFace2D(
+    startFace: number,
+    startHeA: number,
+    initPA: Vec2,
+    initPB: Vec2,
+    initPC: Vec2,
+    initPoint: Vec2,
+    initDir: Vec2,
+    distance: number,
+    initialOutPoint: Vec3,
+  ): Vec3[] {
+    const m = this.inputGeometry.mesh;
+
+    let face = startFace;
+    let heA = startHeA;
     let heB = m.next(heA);
     let heC = m.next(heB);
 
@@ -1466,20 +1740,24 @@ export class SignpostIntrinsicTriangulation {
     let vB = m.vertex(heB);
     let vC = m.vertex(heC);
 
+    // Edge lengths are reassigned per face but only used implicitly via
+    // the laid-out 2D vertex positions; keep them in sync for clarity /
+    // debugging parity with `traceInFaceFromVertexCorner`.
     let lAB = this.inputGeometry.halfedgeLength(heA);
     let lBC = this.inputGeometry.halfedgeLength(heB);
     let lCA = this.inputGeometry.halfedgeLength(heC);
 
-    let pA: Vec2 = [0, 0];
-    let pB: Vec2 = [lAB, 0];
-    let pC = layoutTriangleVertex(pA, pB, lBC, lCA);
+    let pA: Vec2 = [initPA[0], initPA[1]];
+    let pB: Vec2 = [initPB[0], initPB[1]];
+    let pC: Vec2 = [initPC[0], initPC[1]];
 
-    let dir: Vec2 = fromAngle(relAngleRaw);
-    let p: Vec2 = [pA[0], pA[1]];
+    let dir: Vec2 = [initDir[0], initDir[1]];
+    let p: Vec2 = [initPoint[0], initPoint[1]];
     let remaining = distance;
 
-    // Output buffer: starts with the start vertex's 3D position.
-    const out: Vec3[] = [this.inputGeometry.position(vA)];
+    // Output buffer: starts with the externally-supplied start position
+    // (corner vertex / surface-point lift).
+    const out: Vec3[] = [initialOutPoint];
 
     const maxIters = m.nFaces * 4 + 8;
     for (let iter = 0; iter < maxIters; iter++) {

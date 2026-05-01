@@ -111,5 +111,17 @@ if (!resultSP.converged) {
   console.error('smoke[SP]: FAIL — flipOut did not converge');
   process.exit(1);
 }
+// Bug-fix sanity: face-to-face surface-point traces used to fall back to a
+// 2-point straight line for the "both endpoints inserted" segment.
+// `tracePolylineFromSurfacePoint` now walks the input mesh, so the polyline
+// must have intermediate face-crossing points.
+if (resultSP.polyline.length <= 2) {
+  console.error(
+    `smoke[SP]: FAIL — polyline.length=${resultSP.polyline.length} (expected > 2; ` +
+      `face-interior endpoints should produce a multi-segment polyline)`,
+  );
+  process.exit(1);
+}
+console.log(`smoke[SP]: polyline.length=${resultSP.polyline.length} (OK, > 2)`);
 console.log('smoke[SP]: OK');
 console.log('smoke: ALL OK');

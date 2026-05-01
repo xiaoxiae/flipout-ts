@@ -214,6 +214,98 @@ describe('flipOutPathFromSurfacePoints — face-interior to vertex on cube', () 
   });
 });
 
+describe('flipOutPathFromSurfacePoints — face-to-face polyline has > 2 points', () => {
+  // These tests exercise the bug we fixed: face-interior to face-interior
+  // FlipOut paths used to fall back to a 2-point straight line for the
+  // "both endpoints inserted" segment. Now they trace through the input
+  // mesh face-by-face.
+
+  function bbox(verts: readonly (readonly [number, number, number])[]): {
+    lo: [number, number, number];
+    hi: [number, number, number];
+  } {
+    const lo: [number, number, number] = [Infinity, Infinity, Infinity];
+    const hi: [number, number, number] = [-Infinity, -Infinity, -Infinity];
+    for (const v of verts) {
+      for (let k = 0; k < 3; k++) {
+        if (v[k]! < lo[k]!) lo[k] = v[k]!;
+        if (v[k]! > hi[k]!) hi[k] = v[k]!;
+      }
+    }
+    return { lo, hi };
+  }
+
+  function summedLen(polyline: readonly (readonly number[])[]): number {
+    let s = 0;
+    for (let i = 1; i < polyline.length; i++) {
+      const a = polyline[i - 1]!;
+      const b = polyline[i]!;
+      s += Math.hypot(b[0]! - a[0]!, b[1]! - a[1]!, b[2]! - a[2]!);
+    }
+    return s;
+  }
+
+  it('cube: face 0 centroid → face 6 centroid has > 2 polyline points', () => {
+    const m = cube();
+    const sit = buildSit(m);
+    const src: SurfacePoint = { kind: 'face', face: 0, bary: [1 / 3, 1 / 3, 1 / 3] };
+    const dst: SurfacePoint = { kind: 'face', face: 6, bary: [1 / 3, 1 / 3, 1 / 3] };
+    const r = flipOutPathFromSurfacePoints(sit, src, dst);
+    expect(r.polyline.length).toBeGreaterThan(2);
+    // polyline length should equal flipout length (within FP)
+    expect(summedLen(r.polyline)).toBeCloseTo(r.length, 6);
+    // every polyline point lies in the cube's bbox (within tolerance)
+    const { lo, hi } = bbox(m.vertices);
+    const eps = 1e-6;
+    for (const p of r.polyline) {
+      for (let k = 0; k < 3; k++) {
+        expect(p[k]!).toBeGreaterThanOrEqual(lo[k]! - eps);
+        expect(p[k]!).toBeLessThanOrEqual(hi[k]! + eps);
+      }
+    }
+  });
+
+  it('cube: face 4 centroid → face 10 centroid has > 2 polyline points', () => {
+    const m = cube();
+    const sit = buildSit(m);
+    const src: SurfacePoint = { kind: 'face', face: 4, bary: [1 / 3, 1 / 3, 1 / 3] };
+    const dst: SurfacePoint = { kind: 'face', face: 10, bary: [1 / 3, 1 / 3, 1 / 3] };
+    const r = flipOutPathFromSurfacePoints(sit, src, dst);
+    expect(r.polyline.length).toBeGreaterThan(2);
+    expect(summedLen(r.polyline)).toBeCloseTo(r.length, 6);
+  });
+
+  it('icosahedron: face 0 centroid → face 10 centroid has > 2 polyline points', () => {
+    const m = icosahedron();
+    const sit = buildSit(m);
+    const src: SurfacePoint = { kind: 'face', face: 0, bary: [1 / 3, 1 / 3, 1 / 3] };
+    const dst: SurfacePoint = { kind: 'face', face: 10, bary: [1 / 3, 1 / 3, 1 / 3] };
+    const r = flipOutPathFromSurfacePoints(sit, src, dst);
+    expect(r.polyline.length).toBeGreaterThan(2);
+    expect(summedLen(r.polyline)).toBeCloseTo(r.length, 6);
+    // points within icosahedron bbox (radius 1 from origin since the mesh
+    // is unit-sphere-inscribed, with some triangle slack)
+    const { lo, hi } = bbox(m.vertices);
+    const eps = 1e-6;
+    for (const p of r.polyline) {
+      for (let k = 0; k < 3; k++) {
+        expect(p[k]!).toBeGreaterThanOrEqual(lo[k]! - eps);
+        expect(p[k]!).toBeLessThanOrEqual(hi[k]! + eps);
+      }
+    }
+  });
+
+  it('flatGrid 5: face-to-face polyline length matches flipout length', () => {
+    const m = flatGrid(5, 1);
+    const sit = buildSit(m);
+    const src: SurfacePoint = { kind: 'face', face: 0, bary: [1 / 3, 1 / 3, 1 / 3] };
+    const dst: SurfacePoint = { kind: 'face', face: sit.intrinsicMesh.nFaces - 1, bary: [1 / 3, 1 / 3, 1 / 3] };
+    const r = flipOutPathFromSurfacePoints(sit, src, dst);
+    expect(r.polyline.length).toBeGreaterThan(2);
+    expect(summedLen(r.polyline)).toBeCloseTo(r.length, 6);
+  });
+});
+
 describe('flipOutPathFromSurfacePoints — SNAP_EPS exported', () => {
   it('SNAP_EPS is a finite positive constant', () => {
     expect(SNAP_EPS).toBeGreaterThan(0);

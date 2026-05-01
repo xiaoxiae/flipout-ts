@@ -786,16 +786,25 @@ function traceSegmentPolyline(
     return out;
   }
 
-  // Both endpoints inserted. Path is a single segment from src to dst — we
-  // can't easily trace this through the input mesh because both endpoints
-  // are face/edge interiors. As a degenerate fallback, return a straight
-  // line between the two stored 3D positions (correct only when src and
-  // dst are coplanar in some input face).
+  // Both endpoints inserted. Trace from the tail's stored SurfacePoint
+  // along the intrinsic halfedge for the full edge length, walking the
+  // input mesh. The tangent direction at the tail is the rescaled signpost
+  // angle of `segHe`. The trace's first/last point may drift by FP noise
+  // from the stored positions; pin both ends to the stored values.
   const tailLoc = intrinsic.insertedVertexLocations.get(tail);
   const tipLoc = intrinsic.insertedVertexLocations.get(tip);
-  const pa = tailLoc ? intrinsic.surfacePointPosition(tailLoc) : [0, 0, 0];
-  const pb = tipLoc ? intrinsic.surfacePointPosition(tipLoc) : [0, 0, 0];
-  return [pa as Vec3, pb as Vec3];
+  if (tailLoc === undefined || tipLoc === undefined) {
+    // Defensive: shouldn't happen since both vertices were just inserted.
+    const pa = tailLoc ? intrinsic.surfacePointPosition(tailLoc) : [0, 0, 0];
+    const pb = tipLoc ? intrinsic.surfacePointPosition(tipLoc) : [0, 0, 0];
+    return [pa as Vec3, pb as Vec3];
+  }
+  const rawAngle = intrinsic.halfedgeSignposts[segHe]!;
+  const rescaled = rawAngle / intrinsic.vertexAngleScaling(tail);
+  const out = intrinsic.tracePolylineFromSurfacePoint(tailLoc, rescaled, len);
+  if (out.length > 0) out[0] = intrinsic.surfacePointPosition(tailLoc);
+  if (out.length > 1) out[out.length - 1] = intrinsic.surfacePointPosition(tipLoc);
+  return out;
 }
 
 /**
