@@ -48,9 +48,17 @@
         opacity: 0.6;
         font-size: 12px;
       }
-      #reset {
-        pointer-events: auto;
+      #controls {
         margin-top: 8px;
+        display: flex;
+        gap: 8px;
+        align-items: center;
+      }
+      #controls > * {
+        pointer-events: auto;
+      }
+      #reset,
+      #mesh {
         padding: 6px 12px;
         font-size: 13px;
         background: #2c2c38;
@@ -58,8 +66,10 @@
         border: 1px solid #44445a;
         border-radius: 4px;
         cursor: pointer;
+        font-family: inherit;
       }
-      #reset:hover {
+      #reset:hover,
+      #mesh:hover {
         background: #3a3a4a;
       }
       #reset:active {
@@ -69,9 +79,18 @@
   </head>
   <body>
     <div id="overlay">
-      <h1>FlipOut geodesic demo &mdash; click two points on the teapot</h1>
+      <h1>FlipOut geodesic demo &mdash; click two points on the mesh</h1>
       <p id="status">Click to set source.</p>
-      <button id="reset">Reset</button>
+      <div id="controls">
+        <select id="mesh">
+          <option value="teapot">Utah teapot (1601 V)</option>
+          <option value="icosphere">Icosphere (42 V)</option>
+          <option value="icosahedron">Icosahedron (12 V)</option>
+          <option value="cube">Cube (8 V)</option>
+          <option value="grid">Flat grid (16 V)</option>
+        </select>
+        <button id="reset">Reset</button>
+      </div>
       <p id="subtitle">Drag to orbit, scroll to zoom.</p>
     </div>
     <script type="module" src="/src/main.ts"></script>

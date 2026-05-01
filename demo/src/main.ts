@@ -1,4 +1,4 @@
-// FlipOut geodesic demo. Click two points on the teapot to compute the
+// FlipOut geodesic demo. Click two points on the mesh to compute the
 // geodesic between the nearest mesh vertices.
 //
 // Per click-pair the SignpostIntrinsicTriangulation is rebuilt from
@@ -64,9 +64,9 @@ const teapotMaterial = new THREE.MeshStandardMaterial({
   flatShading: false,
 });
 
-async function loadTeapot(): Promise<void> {
-  const res = await fetch('teapot.json');
-  if (!res.ok) throw new Error(`failed to load teapot.json: ${res.status}`);
+async function loadMesh(name: string): Promise<void> {
+  const res = await fetch(`meshes/${name}.json`);
+  if (!res.ok) throw new Error(`failed to load meshes/${name}.json: ${res.status}`);
   const data = (await res.json()) as TeapotJson;
 
   const nV = data.vertices.length;
@@ -92,6 +92,13 @@ async function loadTeapot(): Promise<void> {
   geom.computeVertexNormals();
   geom.computeBoundingBox();
 
+  // Tear down the previous mesh + any markers/path before swapping.
+  clearAll();
+  if (teapotMesh !== null) {
+    scene.remove(teapotMesh);
+    teapotMesh.geometry.dispose();
+  }
+
   teapotMesh = new THREE.Mesh(geom, teapotMaterial);
   scene.add(teapotMesh);
 
@@ -110,9 +117,10 @@ async function loadTeapot(): Promise<void> {
   camera.updateProjectionMatrix();
   controls.update();
 
-  // Build the flipout-ts SurfaceMesh once. flipOutPath mutates the
-  // triangulation, so we keep only the immutable connectivity + positions
-  // here — the SignpostIntrinsicTriangulation is rebuilt per click-pair.
+  // Build the flipout-ts SurfaceMesh once per loaded mesh. flipOutPath
+  // mutates the intrinsic triangulation, so we keep only the immutable
+  // connectivity + positions here — the SignpostIntrinsicTriangulation is
+  // rebuilt per click-pair.
   const r = meshFromBufferGeometry(geom);
   surfaceMesh = r.mesh;
   surfacePositions = r.positions as [number, number, number][];
@@ -129,6 +137,14 @@ let dstVertex = -1;
 
 const statusEl = document.getElementById('status') as HTMLParagraphElement;
 const resetBtn = document.getElementById('reset') as HTMLButtonElement;
+const meshSel = document.getElementById('mesh') as HTMLSelectElement;
+
+meshSel.addEventListener('change', () => {
+  void loadMesh(meshSel.value).catch((err: unknown) => {
+    setStatus(`Failed to load mesh: ${err instanceof Error ? err.message : String(err)}`);
+    console.error(err);
+  });
+});
 
 function setStatus(msg: string): void {
   statusEl.textContent = msg;
@@ -324,11 +340,11 @@ window.addEventListener('resize', () => {
 // Go
 // ---------------------------------------------------------------------------
 
-loadTeapot()
+loadMesh(meshSel.value)
   .then(() => {
     animate();
   })
   .catch((err: unknown) => {
-    setStatus(`Failed to load teapot: ${err instanceof Error ? err.message : String(err)}`);
+    setStatus(`Failed to load mesh: ${err instanceof Error ? err.message : String(err)}`);
     console.error(err);
   });
