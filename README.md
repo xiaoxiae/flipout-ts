@@ -1,35 +1,94 @@
 # flipout-ts
 
-TypeScript port of **FlipOut** — geodesic path computation by edge flips on triangle meshes
-([Sharp & Crane, SIGGRAPH Asia 2020](https://nmwsharp.com/research/flip-geodesics/)).
+TypeScript port of FlipOut, an algorithm for finding geodesic (shortest)
+paths on triangle meshes by iterating edge flips. Originally described in
+[Sharp & Crane, SIGGRAPH Asia 2020](https://nmwsharp.com/media/papers/flip-geodesics/flip_geodesics.pdf);
+ported from the C++ reference in
+[geometry-central](https://github.com/nmwsharp/geometry-central) (MIT).
+Has an optional Three.js adapter.
 
-Based on [geometry-central](https://github.com/nmwsharp/geometry-central) (MIT). See `NOTICE` for attribution.
+There is a [live demo](https://flipout.slama.dev). Source for it is
+in [`demo/`](./demo).
 
-Built for use with **Three.js** (peer dependency, optional).
+<!-- TODO: add demo screenshot/GIF after recording -->
+
+## Install
+
+```bash
+npm install flipout-ts three
+```
+
+`three` is an optional peer dependency — only required if you use the
+`flipout-ts/three` adapter. The core (`flipout-ts`) works on plain `Vec3`
+tuples and typed arrays and has no runtime dependencies.
+
+## Quick start
+
+```ts
+import {
+  SurfaceMesh,
+  VertexPositionGeometry,
+  SignpostIntrinsicTriangulation,
+  flipOutPath,
+} from 'flipout-ts';
+import { meshFromBufferGeometry, pathToBufferGeometry } from 'flipout-ts/three';
+
+// 1. Adapt a THREE.BufferGeometry → SurfaceMesh + Vec3[] positions.
+const { mesh, positions } = meshFromBufferGeometry(threeBufferGeom);
+
+// 2. Wrap into a (extrinsic) geometry, then build an intrinsic triangulation.
+const geom = new VertexPositionGeometry(mesh, positions);
+const intrinsic = new SignpostIntrinsicTriangulation(geom);
+
+// 3. Compute the geodesic between two vertex indices.
+const result = flipOutPath(intrinsic, /* srcVertex */ 0, /* dstVertex */ 42);
+
+console.log(result.length);    // total surface length
+console.log(result.polyline);  // Vec3[] of points along the geodesic
+
+// 4. (Optional) Lift the polyline back to a THREE.Line.
+const lineGeom = pathToBufferGeometry(result.polyline);
+```
+
+For source / destination at face-interior or edge-interior points (not just
+vertices), use `flipOutPathFromSurfacePoints` from `flipout-ts/flipout`. The
+intrinsic triangulation is mutated in-place by the algorithm; rebuild it for
+each independent query.
+
+## Demo
+
+The [live demo](https://flipout.slama.dev) lets you click two points on a
+mesh and renders the geodesic between them. To run it locally, see
+[`demo/README.md`](./demo/README.md).
 
 ## Status
 
-The port is layered. Each layer ships with its own tests; later layers depend on earlier ones.
+The port is layered. Each layer ships with its own tests; later layers depend
+on earlier ones.
 
 | Layer | Module | Status | Source (geometry-central) |
 | --- | --- | --- | --- |
-| L0 | `src/math/` — Vec3 ops, barycentric, predicates | ✅ done (116 tests) | `utilities/vector*.h`, `numerical/linear_algebra_utilities.h` |
-| L1 | `src/mesh/` — `SurfaceMesh`, iteration, edge flip | ✅ done (129 tests) | `surface/surface_mesh.cpp`, `halfedge_mesh.cpp` |
-| L2 | `src/geometry/` — `VertexPositionGeometry` | ✅ done (73 tests) | `surface/vertex_position_geometry.cpp` |
-| L3 | `src/intrinsic/` — `SignpostIntrinsicTriangulation` | ✅ done (113 tests) | `surface/signpost_intrinsic_triangulation.cpp` |
-| L4 | `src/flipout/` — `FlipEdgeNetwork` (the algorithm) | ✅ done (110 tests) | `surface/flip_geodesics.cpp` |
-| L5 | `src/three/` — `THREE.BufferGeometry` adapter | ✅ done (35 tests) | new code |
+| L0 | `src/math/` — Vec3 ops, barycentric, predicates | done (116 tests) | `utilities/vector*.h`, `numerical/linear_algebra_utilities.h` |
+| L1 | `src/mesh/` — `SurfaceMesh`, iteration, edge flip | done (163 tests) | `surface/surface_mesh.cpp`, `halfedge_mesh.cpp` |
+| L2 | `src/geometry/` — `VertexPositionGeometry` | done (73 tests) | `surface/vertex_position_geometry.cpp` |
+| L3 | `src/intrinsic/` — `SignpostIntrinsicTriangulation` | done (175 tests) | `surface/signpost_intrinsic_triangulation.cpp` |
+| L4 | `src/flipout/` — `FlipEdgeNetwork` (the algorithm) | done (125 tests) | `surface/flip_geodesics.cpp` |
+| L5 | `src/three/` — `THREE.BufferGeometry` adapter | done (35 tests) | new code |
+
+Total: **688 tests** (plus a 1-test scaffold sanity check).
 
 ## Test strategy
 
 Each layer has tests in three styles:
 
-1. **Mathematical invariants** — flips preserve area, lengths satisfy triangle inequality,
-   path length monotonically decreases per iteration, etc. No ground truth needed.
-2. **Hand-computed examples** — flat quad, tetrahedron edge-to-edge, cylinder unrolling.
-   ~10 cases total, each with paper math behind it.
-3. **Golden fixtures from `potpourri3d`** — committed JSON in `fixtures/`, regenerated
-   by `tools/gen_fixtures.py` (Python + `potpourri3d`, only needed to regenerate).
+1. **Mathematical invariants** — flips preserve area, lengths satisfy triangle
+   inequality, path length monotonically decreases per iteration, etc. No
+   ground truth needed.
+2. **Hand-computed examples** — flat quad, tetrahedron edge-to-edge, cylinder
+   unrolling. ~10 cases total, each with paper math behind it.
+3. **Golden fixtures from `potpourri3d`** — committed JSON in `fixtures/`,
+   regenerated by `tools/gen_fixtures.py` (Python + `potpourri3d`, only needed
+   to regenerate).
 
 ```bash
 npm install
@@ -53,12 +112,17 @@ The TS test suite reads from `fixtures/` directly — no Python at runtime.
 
 ## Port conventions
 
-- **One source file per geometry-central translation unit.** A header banner names the
-  source file and SHA of geometry-central it was ported from.
-- **Naming preserved where possible** (`SurfaceMesh`, `VertexPositionGeometry`, `flipEdge`).
-  TS conventions used for casing (camelCase methods, PascalCase classes).
-- **No Three.js inside `src/{math,mesh,geometry,intrinsic,flipout}`.** Three.js types
-  appear only in `src/three/`. The core works on plain typed arrays / `Vec3` tuples.
-- **Numerical type:** `number` (Float64) throughout, matching geometry-central's `double`.
+- **One source file per geometry-central translation unit.** A header banner
+  names the source file and SHA of geometry-central it was ported from.
+- **Naming preserved where possible** (`SurfaceMesh`, `VertexPositionGeometry`,
+  `flipEdge`). TS conventions used for casing (camelCase methods, PascalCase
+  classes).
+- **No Three.js inside `src/{math,mesh,geometry,intrinsic,flipout}`.** Three.js
+  types appear only in `src/three/`. The core works on plain typed arrays /
+  `Vec3` tuples.
+- **Numerical type:** `number` (Float64) throughout, matching geometry-central's
+  `double`.
 
-See `../flipout-demo/` for an interactive demo on the Utah teapot.
+## License
+
+MIT — see `LICENSE` and `NOTICE` for the geometry-central attribution.
