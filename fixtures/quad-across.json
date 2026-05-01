@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "name": "quad-across",
+  "note": "non-shared diagonal -> goes across both tris",
+  "mesh": {
+    "vertices": [
+      [
+        0.0,
+        0.0,
+        0.0
+      ],
+      [
+        1.0,
+        0.0,
+        0.0
+      ],
+      [
+        1.0,
+        1.0,
+        0.0
+      ],
+      [
+        0.0,
+        1.0,
+        0.0
+      ]
+    ],
+    "faces": [
+      [
+        0,
+        1,
+        2
+      ],
+      [
+        0,
+        2,
+        3
+      ]
+    ]
+  },
+  "query": {
+    "src": 1,
+    "dst": 3
+  },
+  "expected": {
+    "path_length": 1.4142135623730951,
+    "path_points": [
+      [
+        1.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.5000000000000002,
+        0.5000000000000002,
+        0.0
+      ],
+      [
+        0.0,
+        1.0,
+        0.0
+      ]
+    ]
+  },
+  "potpourri3d_version": "1.4.0"
+}

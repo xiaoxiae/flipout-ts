@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "name": "tetrahedron-edge",
+  "note": "adjacent vertices, single edge",
+  "mesh": {
+    "vertices": [
+      [
+        1.0,
+        1.0,
+        1.0
+      ],
+      [
+        -1.0,
+        -1.0,
+        1.0
+      ],
+      [
+        -1.0,
+        1.0,
+        -1.0
+      ],
+      [
+        1.0,
+        -1.0,
+        -1.0
+      ]
+    ],
+    "faces": [
+      [
+        0,
+        1,
+        2
+      ],
+      [
+        0,
+        3,
+        1
+      ],
+      [
+        0,
+        2,
+        3
+      ],
+      [
+        1,
+        3,
+        2
+      ]
+    ]
+  },
+  "query": {
+    "src": 0,
+    "dst": 1
+  },
+  "expected": {
+    "path_length": 2.8284271247461903,
+    "path_points": [
+      [
+        1.0,
+        1.0,
+        1.0
+      ],
+      [
+        -1.0,
+        -1.0,
+        1.0
+      ]
+    ]
+  },
+  "potpourri3d_version": "1.4.0"
+}

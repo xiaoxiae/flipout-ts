@@ -1,0 +1,20 @@
+flipout-ts
+==========
+
+This package is a TypeScript port of the FlipOut geodesic path-straightening
+algorithm and supporting half-edge / intrinsic-triangulation infrastructure
+from geometry-central:
+
+    https://github.com/nmwsharp/geometry-central
+    Copyright (c) 2017-2020 Nicholas Sharp and the geometry-central contributors
+    Licensed under the MIT License (see LICENSE)
+
+The algorithm is described in:
+
+    Sharp, N., & Crane, K. (2020).
+    "You Can Find Geodesic Paths in Triangle Meshes by Just Flipping Edges."
+    ACM Transactions on Graphics (SIGGRAPH Asia 2020), 39(6).
+    https://nmwsharp.com/research/flip-geodesics/
+
+When porting, source files include a "// Ported from geometry-central:
+<path>" reference so the lineage of every translated function is auditable.
