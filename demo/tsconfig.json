@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "lib": ["ES2022", "DOM"],
+    "noEmit": true,
+    "paths": {
+      "@chalkbag/flipout-ts/three": ["../flipout-ts/src/three/index.ts"],
+      "@chalkbag/flipout-ts/flipout": ["../flipout-ts/src/flipout/index.ts"],
+      "@chalkbag/flipout-ts": ["../flipout-ts/src/index.ts"]
+    }
+  },
+  "include": ["src", "vite.config.ts"]
+}

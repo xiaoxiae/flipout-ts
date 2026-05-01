@@ -60,3 +60,5 @@ The TS test suite reads from `fixtures/` directly — no Python at runtime.
 - **No Three.js inside `src/{math,mesh,geometry,intrinsic,flipout}`.** Three.js types
   appear only in `src/three/`. The core works on plain typed arrays / `Vec3` tuples.
 - **Numerical type:** `number` (Float64) throughout, matching geometry-central's `double`.
+
+See `../flipout-demo/` for an interactive demo on the Utah teapot.
