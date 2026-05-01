@@ -7,5 +7,12 @@ export { SurfaceMesh, INVALID_INDEX } from './mesh/index.js';
 export type { Triangle } from './mesh/index.js';
 export { VertexPositionGeometry } from './geometry/index.js';
 export { SignpostIntrinsicTriangulation, layoutTriangleVertex } from './intrinsic/index.js';
-export type { TraceResult } from './intrinsic/index.js';
-export { FlipEdgeNetwork, flipOutPath, SegmentAngleType, shortestEdgePath } from './flipout/index.js';
+export type { TraceResult, SurfacePoint } from './intrinsic/index.js';
+export {
+  FlipEdgeNetwork,
+  flipOutPath,
+  flipOutPathFromSurfacePoints,
+  SegmentAngleType,
+  SNAP_EPS,
+  shortestEdgePath,
+} from './flipout/index.js';

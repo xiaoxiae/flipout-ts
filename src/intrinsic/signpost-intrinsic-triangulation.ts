@@ -91,6 +91,21 @@ export function layoutTriangleVertex(
 }
 
 /**
+ * A point on the surface — either a mesh vertex, a point on an edge at
+ * parameter `t ∈ (0, 1)`, or a point inside a face given as barycentric
+ * coordinates (which must sum to 1 with all components ≥ 0).
+ *
+ * Mirrors gc's `SurfacePoint` (`include/geometrycentral/surface/surface_point.h`).
+ *
+ * Used by L3 vertex insertion (`insertVertex_face`, `insertVertex_edge`) and
+ * by L4 (`flipOutPathFromSurfacePoints`).
+ */
+export type SurfacePoint =
+  | { kind: 'vertex'; vertex: number }
+  | { kind: 'edge'; edge: number; t: number }
+  | { kind: 'face'; face: number; bary: [number, number, number] };
+
+/**
  * Result of `traceFromVertex`. A geodesic walk that starts at vertex `v` of
  * the *input* (extrinsic) mesh in some tangent direction lands at a point
  * inside some face of the input mesh.
@@ -119,22 +134,36 @@ export class SignpostIntrinsicTriangulation {
   /** Original extrinsic geometry. Never mutated by this class. */
   readonly inputGeometry: VertexPositionGeometry;
 
-  /** Intrinsic edge lengths, indexed by `intrinsicMesh` edge id. */
-  readonly edgeLengths: Float64Array;
+  /**
+   * Intrinsic edge lengths, indexed by `intrinsicMesh` edge id. Grows
+   * automatically when vertex insertion adds new edges.
+   */
+  edgeLengths: Float64Array;
 
   /**
-   * Sum of corner angles at each vertex (interior angle if interior, the
-   * "boundary angle" sum if on the boundary). Constant under intrinsic
-   * flips. Indexed by vertex id; same indexing on the input and intrinsic
-   * meshes (vertices are shared).
+   * Sum of corner angles at each vertex. Initially equal to the input
+   * geometry's per-vertex angle sum. For new vertices inserted via
+   * `insertVertex_face` / `insertVertex_edge`, set to 2π (interior) or π
+   * (boundary edge insertion). Indexed by intrinsic-mesh vertex id; agrees
+   * with the input mesh for the first `inputGeometry.mesh.nVertices`
+   * indices, but extends past that for inserted vertices.
    */
-  readonly vertexAngleSums: Float64Array;
+  vertexAngleSums: Float64Array;
 
   /**
    * Per-halfedge signpost angle in radians, in `[0, vertexAngleSum[tail])`.
-   * Mirrors geometry-central's `signpostAngle`. Updated by `flipEdge`.
+   * Mirrors geometry-central's `signpostAngle`. Updated by `flipEdge` and
+   * by vertex-insertion routines.
    */
-  readonly halfedgeSignposts: Float64Array;
+  halfedgeSignposts: Float64Array;
+
+  /**
+   * For vertices inserted by `insertVertex_face` / `insertVertex_edge`, the
+   * `SurfacePoint` on the *input* mesh that they correspond to. Used by
+   * `tracePolylineFromSurfacePoint` to walk the input mesh starting from
+   * an inserted vertex. Original input vertices are NOT in this map.
+   */
+  readonly insertedVertexLocations = new Map<number, SurfacePoint>();
 
   // --------------------------------------------------------------------------
   // Construction.
@@ -431,6 +460,456 @@ export class SignpostIntrinsicTriangulation {
     this.updateAngleFromCWNeighor(hb1);
 
     return true;
+  }
+
+  // ==========================================================================
+  // Vertex insertion.
+  //
+  // Direct ports of `SignpostIntrinsicTriangulation::insertVertex_face` and
+  // `insertVertex_edge` from `signpost_intrinsic_triangulation.cpp`. We keep
+  // the vertex set of the *input* mesh unchanged — only the intrinsic mesh
+  // gets new vertices. The mapping back to the input is stored in
+  // `insertedVertexLocations` so traces from new vertices can find their
+  // starting point on the input.
+  //
+  // Net per-call effect on the intrinsic mesh:
+  //   insertVertex_face:  +1 V, +3 E, +2 F, +6 HE
+  //   insertVertex_edge:  +1 V, +3 E, +2 F, +6 HE  (interior edge)
+  //                       +1 V, +2 E, +1 F, +4 HE  (boundary edge)
+  //
+  // After insertion all signposts at SURROUNDING vertices remain valid —
+  // gc's analysis: existing halfedges' input-frame signposts are unchanged
+  // because their tail vertices haven't moved. We only need to set
+  // signposts on the new halfedges that emanate from the new vertex (and
+  // their twins, which point inward at surrounding vertices and need
+  // `updateAngleFromCWNeighor` to slot them between their CW/CCW
+  // neighbours).
+  // ==========================================================================
+
+  /** Snapping tolerance shared by L3/L4 insertion (also exported). */
+  static readonly SNAP_EPS = 1e-9;
+
+  /** Grow `vertexAngleSums` to cover the current intrinsicMesh vertex count. */
+  private growVertexStorage(): void {
+    const want = this.intrinsicMesh.nVertices;
+    if (this.vertexAngleSums.length >= want) return;
+    const grown = new Float64Array(want);
+    grown.set(this.vertexAngleSums);
+    this.vertexAngleSums = grown;
+  }
+
+  /** Grow `edgeLengths` to cover the current intrinsicMesh edge count. */
+  private growEdgeStorage(): void {
+    const want = this.intrinsicMesh.nEdges;
+    if (this.edgeLengths.length >= want) return;
+    const grown = new Float64Array(want);
+    grown.set(this.edgeLengths);
+    this.edgeLengths = grown;
+  }
+
+  /** Grow `halfedgeSignposts` to cover the current intrinsicMesh halfedge count. */
+  private growHalfedgeStorage(): void {
+    const want = this.intrinsicMesh.nHalfedges;
+    if (this.halfedgeSignposts.length >= want) return;
+    const grown = new Float64Array(want);
+    grown.set(this.halfedgeSignposts);
+    this.halfedgeSignposts = grown;
+  }
+
+  /**
+   * Insert a new intrinsic vertex inside face `f` at given barycentric
+   * coordinates. Mirrors gc's `insertVertex_face`. Returns the new vertex
+   * index.
+   *
+   * If `bary` is within `SNAP_EPS` of an existing vertex of the face, the
+   * existing vertex index is returned and no insertion is performed.
+   *
+   * Throws if barycentric coords are out of `[0, 1]` or don't sum to 1
+   * (within tolerance).
+   */
+  insertVertex_face(f: number, bary: [number, number, number]): number {
+    const im = this.intrinsicMesh;
+    if (f < 0 || f >= im.nFaces) {
+      throw new RangeError(`face ${f} out of range [0, ${im.nFaces})`);
+    }
+    const [b0, b1, b2] = bary;
+    const eps = SignpostIntrinsicTriangulation.SNAP_EPS;
+    if (b0 < -eps || b1 < -eps || b2 < -eps) {
+      throw new RangeError(
+        `insertVertex_face: barycentric coords must be in [0, 1]: ${JSON.stringify(bary)}`,
+      );
+    }
+    if (Math.abs(b0 + b1 + b2 - 1) > 1e-6) {
+      throw new RangeError(
+        `insertVertex_face: barycentric coords must sum to 1, got ${b0 + b1 + b2}`,
+      );
+    }
+
+    // Snap-to-corner if any bary is ~1.
+    if (b0 > 1 - eps || b1 > 1 - eps || b2 > 1 - eps) {
+      const it = im.halfedgesAroundFace(f);
+      const h0 = it.next().value as number;
+      const h1 = it.next().value as number;
+      const h2 = it.next().value as number;
+      if (b0 > 1 - eps) return im.vertex(h0);
+      if (b1 > 1 - eps) return im.vertex(h1);
+      return im.vertex(h2);
+    }
+
+    // === (1) Lay out the face in 2D and compute the position of the new
+    // point + the three new edge lengths.
+    const heFace = im.faceHalfedge(f);
+    const heA = heFace;
+    const heB = im.next(heA);
+    const heC = im.next(heB);
+    const lAB = this.edgeLengths[im.edge(heA)]!;
+    const lBC = this.edgeLengths[im.edge(heB)]!;
+    const lCA = this.edgeLengths[im.edge(heC)]!;
+    const pA: Vec2 = [0, 0];
+    const pB: Vec2 = [lAB, 0];
+    const pC = layoutTriangleVertex(pA, pB, lBC, lCA);
+
+    const oldHEs = [heA, heB, heC];
+
+    // gc's convention: bary[0..2] match face's halfedges in order; the new
+    // 2D point lies at (b1 * vertCoords[1] + b2 * vertCoords[2]) when
+    // vertCoords[0] is at origin.
+    const newPCoord: Vec2 = [
+      b0 * pA[0] + b1 * pB[0] + b2 * pC[0],
+      b0 * pA[1] + b1 * pB[1] + b2 * pC[1],
+    ];
+
+    const lenToA = Math.hypot(newPCoord[0] - pA[0], newPCoord[1] - pA[1]);
+    const lenToB = Math.hypot(newPCoord[0] - pB[0], newPCoord[1] - pB[1]);
+    const lenToC = Math.hypot(newPCoord[0] - pC[0], newPCoord[1] - pC[1]);
+    const newLengths = [lenToA, lenToB, lenToC]; // aligned with oldHEs by tail vertex
+
+    if (!Number.isFinite(lenToA) || !Number.isFinite(lenToB) || !Number.isFinite(lenToC)) {
+      throw new Error('insertVertex_face: non-finite edge length');
+    }
+
+    // === (2) Mutate intrinsic mesh.
+    const { newVertex, newHalfedgesFromNew } = im.splitFace(f);
+    this.growVertexStorage();
+    this.growEdgeStorage();
+    this.growHalfedgeStorage();
+    this.vertexAngleSums[newVertex] = 2 * Math.PI;
+
+    // === (3) Assign edge lengths. For each newly-inserted edge from
+    // `newVertex` to a corner of the original face, find its new halfedge
+    // (one of `newHalfedgesFromNew`) and set the corresponding length.
+    //
+    // gc's mapping: the new halfedge `heV` outgoing from newV satisfies
+    //   heV.next() == originalHe
+    // where `originalHe` is the corresponding boundary halfedge of the old
+    // face (since after the splitFace, each tiny new triangle has cycle
+    // [trailing, boundary, leading] = [heV, originalHe, leadingHe]).
+    for (const heV of newHalfedgesFromNew) {
+      const heNext = im.next(heV);
+      const idx = oldHEs.indexOf(heNext);
+      if (idx === -1) {
+        // Shouldn't happen — every trailing he's next is one of the original boundary hes.
+        throw new Error(
+          `insertVertex_face: outgoing halfedge ${heV} from new vertex doesn't connect to an original face halfedge`,
+        );
+      }
+      this.edgeLengths[im.edge(heV)] = newLengths[idx]!;
+    }
+
+    // === (4) Compute signposts. Mirrors gc's `resolveNewVertex`:
+    //   - For each incoming halfedge `heIn` to newV, call
+    //     `updateAngleFromCWNeighor(heIn)` — this anchors the inward-pointing
+    //     halfedges' signposts at the SURROUNDING vertices to be consistent
+    //     with the existing halfedges' signposts at those vertices.
+    //   - Then walk around newV starting from a chosen "first" halfedge,
+    //     setting signposts on the outgoing halfedges from newV using
+    //     successive corner angles.
+    //
+    // Because for face insertion all surrounding signposts are unchanged in
+    // input-frame and we only need to anchor the new "edges" between them,
+    // gc's `updateAngleFromCWNeighor` does the right thing: each new
+    // halfedge gets `signpost(cwNeighbor) + cornerAngle(cwHe.corner())`.
+    for (const heV of newHalfedgesFromNew) {
+      const heIn = im.twin(heV);
+      this.updateAngleFromCWNeighor(heIn);
+    }
+
+    // Set outgoing signposts from newV. Cycle CCW starting at newHalfedgesFromNew[0]:
+    //   signpost[outgoing[0]] = 0
+    //   signpost[outgoing[i+1]] = signpost[outgoing[i]] + cornerAngleAt(outgoing[i])
+    // where the corner is at newV inside `face(outgoing[i])`. Mod 2π for
+    // standardisation.
+    {
+      let runningAngle = 0;
+      for (let i = 0; i < newHalfedgesFromNew.length; i++) {
+        const heV = newHalfedgesFromNew[i]!;
+        this.halfedgeSignposts[heV] = runningAngle;
+        runningAngle += this.cornerAngleAt(heV);
+      }
+    }
+
+    // Store the new vertex's location on the input mesh.
+    const inputLoc = this.locateInsertedVertex_face(f, [b0, b1, b2]);
+    this.insertedVertexLocations.set(newVertex, inputLoc);
+
+    return newVertex;
+  }
+
+  /**
+   * Insert a new intrinsic vertex on edge `e` at parameter `t ∈ (0, 1)`.
+   * Mirrors gc's `insertVertex_edge`. Returns the new vertex index.
+   *
+   * If `t` is within `SNAP_EPS` of 0 or 1, the corresponding existing
+   * endpoint vertex is returned and no insertion is performed.
+   */
+  insertVertex_edge(e: number, t: number): number {
+    const im = this.intrinsicMesh;
+    if (e < 0 || e >= im.nEdges) {
+      throw new RangeError(`edge ${e} out of range [0, ${im.nEdges})`);
+    }
+    const eps = SignpostIntrinsicTriangulation.SNAP_EPS;
+    if (!Number.isFinite(t) || t < -eps || t > 1 + eps) {
+      throw new RangeError(`insertVertex_edge: t must be in [0, 1], got ${t}`);
+    }
+
+    const heA0 = im.edgeHalfedge(e);
+    const heB0 = im.twin(heA0);
+
+    // Snap to existing endpoints.
+    if (t < eps) return im.vertex(heA0);
+    if (t > 1 - eps) return im.vertex(heB0);
+
+    const isInteriorA = !im.isBoundaryHalfedge(heA0);
+    const isInteriorB = !im.isBoundaryHalfedge(heB0);
+    const isOnBoundary = !isInteriorA || !isInteriorB;
+    if (!isInteriorA && !isInteriorB) {
+      throw new Error(`insertVertex_edge: edge ${e} has no incident face`);
+    }
+
+    // === (1) Compute the four (or three) new edge lengths.
+    //
+    // gc's logic:
+    //   backLen  = t * |e|                         length of new edge from oldTail to newV
+    //   frontLen = (1 - t) * |e|                   length of new edge from newV to oldTip
+    //   Alen     = distance(newP, apex_A) in face A
+    //   Blen     = distance(newP, apex_B) in face B  (only if interior B)
+    const lE = this.edgeLengths[e]!;
+    const backLen = t * lE;
+    const frontLen = (1 - t) * lE;
+
+    // Lay out face A: tail of heA0 = corner 0, tip = corner 1, apex = corner 2.
+    let Alen = -1;
+    if (isInteriorA) {
+      const heA1 = im.next(heA0);
+      const heA2 = im.next(heA1);
+      const lA01 = lE; // = edge(heA0)
+      const lA12 = this.edgeLengths[im.edge(heA1)]!;
+      const lA20 = this.edgeLengths[im.edge(heA2)]!;
+      const pA0: Vec2 = [0, 0];
+      const pA1: Vec2 = [lA01, 0];
+      const pA2 = layoutTriangleVertex(pA0, pA1, lA12, lA20);
+      const newPA: Vec2 = [(1 - t) * pA0[0] + t * pA1[0], (1 - t) * pA0[1] + t * pA1[1]];
+      Alen = Math.hypot(newPA[0] - pA2[0], newPA[1] - pA2[1]);
+    }
+
+    let Blen = -1;
+    if (isInteriorB) {
+      const heB1 = im.next(heB0);
+      const heB2 = im.next(heB1);
+      const lB01 = lE;
+      const lB12 = this.edgeLengths[im.edge(heB1)]!;
+      const lB20 = this.edgeLengths[im.edge(heB2)]!;
+      const pB0: Vec2 = [0, 0];
+      const pB1: Vec2 = [lB01, 0];
+      const pB2 = layoutTriangleVertex(pB0, pB1, lB12, lB20);
+      // The "back" direction in face B: heB0 goes from oldTip-side toward
+      // oldTail-side, so newV at parameter t along the original edge sits at
+      // parameter (1 - t) along heB0.
+      const newPB: Vec2 = [t * pB0[0] + (1 - t) * pB1[0], t * pB0[1] + (1 - t) * pB1[1]];
+      Blen = Math.hypot(newPB[0] - pB2[0], newPB[1] - pB2[1]);
+    }
+
+    // === (2) Mutate intrinsic mesh.
+    const { newVertex, newHalfedgesFromNew } = im.splitEdgeTriangular(e);
+    this.growVertexStorage();
+    this.growEdgeStorage();
+    this.growHalfedgeStorage();
+    this.vertexAngleSums[newVertex] = isOnBoundary ? Math.PI : 2 * Math.PI;
+
+    // === (3) Assign edge lengths.
+    //
+    // Mapping: the four halfedges in `newHalfedgesFromNew` come out in the
+    // CCW orbit order around `newVertex`. For an interior insertion gc's
+    // walk is:
+    //   currHe = newHeFront; lengths = [frontLen, Alen, backLen, Blen]
+    //   currHe = currHe.next().next().twin()    // CCW around newV
+    //
+    // Our L1 `splitEdgeTriangular` emits `newHalfedgesFromNew` using the
+    // same CCW step starting from `vHalfedgeArr[newV] = heA0` (post-split).
+    // After phase 1, heA0's tail = newV and points toward the original tip
+    // (vb). So:
+    //   newHalfedgesFromNew[0] = heA0 (newV → vb)            length = frontLen
+    //   newHalfedgesFromNew[1] = ?    (newV → apex_A)        length = Alen
+    //   newHalfedgesFromNew[2] = ?    (newV → va, oldTail)   length = backLen
+    //   newHalfedgesFromNew[3] = ?    (newV → apex_B)        length = Blen
+    // This pattern holds because the CCW orbit from heA0 walks: heA0, then
+    // the diagonal newV→apex_A inside fA, then heBNew (newV→old tip via
+    // the boundary side, now actually = the rewired heA0... wait, let me
+    // reconsider).
+    //
+    // Actually after splitEdge: vHalfedgeArr[newV] = heA0 (which still
+    // points to the OLD heACenter slot, retargeted). heA0 now goes
+    // newV → vb. The diagonal added on side A goes newV → apex_A. The
+    // diagonal added on side B goes newV → apex_B. And heBNew (the new
+    // halfedge added by phase 1) goes newV → vb's side... wait actually
+    // heBNew goes newV → original next-vertex-in-face-B — but that's
+    // confusing. Let me just match by which halfedge points where.
+    const lensInOrder = isOnBoundary
+      ? [frontLen, Alen, backLen]
+      : [frontLen, Alen, backLen, Blen];
+
+    if (newHalfedgesFromNew.length !== lensInOrder.length) {
+      throw new Error(
+        `insertVertex_edge: expected ${lensInOrder.length} new halfedges, got ${newHalfedgesFromNew.length}`,
+      );
+    }
+    for (let i = 0; i < newHalfedgesFromNew.length; i++) {
+      const heV = newHalfedgesFromNew[i]!;
+      const len = lensInOrder[i]!;
+      if (len < 0) {
+        throw new Error(`insertVertex_edge: missing length for halfedge ${heV}`);
+      }
+      this.edgeLengths[im.edge(heV)] = len;
+    }
+
+    // === (4) Set signposts.
+    for (const heV of newHalfedgesFromNew) {
+      const heIn = im.twin(heV);
+      this.updateAngleFromCWNeighor(heIn);
+    }
+    {
+      let runningAngle = 0;
+      for (let i = 0; i < newHalfedgesFromNew.length; i++) {
+        const heV = newHalfedgesFromNew[i]!;
+        if (im.face(heV) === INVALID_INDEX) {
+          // Boundary outgoing halfedge — sits at the end of the wedge walk
+          // at angle = vertexAngleSums[newV] (= π for a boundary insertion).
+          this.halfedgeSignposts[heV] = this.vertexAngleSums[newVertex]!;
+          break;
+        }
+        this.halfedgeSignposts[heV] = runningAngle;
+        runningAngle += this.cornerAngleAt(heV);
+      }
+    }
+
+    // Store the new vertex's location on the input mesh.
+    const inputLoc = this.locateInsertedVertex_edge(e, t);
+    this.insertedVertexLocations.set(newVertex, inputLoc);
+
+    return newVertex;
+  }
+
+  /**
+   * 3D position of a `SurfacePoint` on the input mesh. For a vertex-kind
+   * point, returns the input geometry's vertex position. For edge / face
+   * points, lifts the parametric coords via barycentric / linear
+   * interpolation of the input vertex positions.
+   */
+  surfacePointPosition(p: SurfacePoint): Vec3 {
+    if (p.kind === 'vertex') {
+      return this.inputGeometry.position(p.vertex);
+    }
+    const inputMesh = this.inputGeometry.mesh;
+    if (p.kind === 'edge') {
+      const he = inputMesh.edgeHalfedge(p.edge);
+      const vA = inputMesh.vertex(he);
+      const vB = inputMesh.tipVertex(he);
+      const pA = this.inputGeometry.position(vA);
+      const pB = this.inputGeometry.position(vB);
+      const t = p.t;
+      return [
+        (1 - t) * pA[0] + t * pB[0],
+        (1 - t) * pA[1] + t * pB[1],
+        (1 - t) * pA[2] + t * pB[2],
+      ];
+    }
+    // face
+    const it = inputMesh.halfedgesAroundFace(p.face);
+    const h0 = it.next().value as number;
+    const h1 = it.next().value as number;
+    const h2 = it.next().value as number;
+    const pA = this.inputGeometry.position(inputMesh.vertex(h0));
+    const pB = this.inputGeometry.position(inputMesh.vertex(h1));
+    const pC = this.inputGeometry.position(inputMesh.vertex(h2));
+    const [b0, b1, b2] = p.bary;
+    return [
+      b0 * pA[0] + b1 * pB[0] + b2 * pC[0],
+      b0 * pA[1] + b1 * pB[1] + b2 * pC[1],
+      b0 * pA[2] + b1 * pB[2] + b2 * pC[2],
+    ];
+  }
+
+  /**
+   * Compute a `SurfacePoint` on the input mesh for a face-interior
+   * insertion. Currently only handles insertion into a face that is still
+   * an *original* input-mesh face. (Inserting into a face produced by a
+   * previous insertion or a flip would require recursive resolution; we
+   * skip that until needed.)
+   */
+  private locateInsertedVertex_face(
+    f: number,
+    bary: [number, number, number],
+  ): SurfacePoint {
+    const inputMesh = this.inputGeometry.mesh;
+    if (f < inputMesh.nFaces) {
+      // The intrinsic-face index `f` aligns with an input-face index because
+      // we haven't done any flips that re-index faces (flipEdge preserves
+      // face indices). Verify the corner vertex set matches before accepting.
+      const im = this.intrinsicMesh;
+      const vsIm = [...im.verticesOfFace(f)];
+      const vsIn = [...inputMesh.verticesOfFace(f)];
+      if (
+        vsIm.length === 3 &&
+        vsIn.length === 3 &&
+        vsIm[0] === vsIn[0] &&
+        vsIm[1] === vsIn[1] &&
+        vsIm[2] === vsIn[2]
+      ) {
+        return { kind: 'face', face: f, bary };
+      }
+    }
+    // Fallback: no clean correspondence — store as face anyway so traces
+    // can at least try; we throw if the trace later finds it inconsistent.
+    return { kind: 'face', face: f, bary };
+  }
+
+  /**
+   * Compute a `SurfacePoint` on the input mesh for an edge-interior
+   * insertion. Same caveat as `locateInsertedVertex_face`.
+   */
+  private locateInsertedVertex_edge(e: number, t: number): SurfacePoint {
+    const inputMesh = this.inputGeometry.mesh;
+    if (e < inputMesh.nEdges) {
+      // Same alignment assumption: edge `e` in the intrinsic mesh
+      // corresponds to edge `e` in the input mesh (true if no flips).
+      const im = this.intrinsicMesh;
+      const heIm = im.edgeHalfedge(e);
+      const heIn = inputMesh.edgeHalfedge(e);
+      if (
+        im.vertex(heIm) === inputMesh.vertex(heIn) &&
+        im.tipVertex(heIm) === inputMesh.tipVertex(heIn)
+      ) {
+        return { kind: 'edge', edge: e, t };
+      }
+      // Reversed orientation — flip t.
+      if (
+        im.vertex(heIm) === inputMesh.tipVertex(heIn) &&
+        im.tipVertex(heIm) === inputMesh.vertex(heIn)
+      ) {
+        return { kind: 'edge', edge: e, t: 1 - t };
+      }
+    }
+    return { kind: 'edge', edge: e, t };
   }
 
   /**

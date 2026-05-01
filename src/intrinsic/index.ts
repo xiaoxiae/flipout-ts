@@ -18,4 +18,4 @@ export {
   SignpostIntrinsicTriangulation,
   layoutTriangleVertex,
 } from './signpost-intrinsic-triangulation.js';
-export type { TraceResult } from './signpost-intrinsic-triangulation.js';
+export type { TraceResult, SurfacePoint } from './signpost-intrinsic-triangulation.js';

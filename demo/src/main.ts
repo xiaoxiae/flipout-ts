@@ -1,9 +1,11 @@
-// FlipOut geodesic demo. Click two points on the mesh to compute the
-// geodesic between the nearest mesh vertices.
+// FlipOut geodesic demo. Click two points on the mesh — anywhere, including
+// face interiors and edge midpoints — to compute the geodesic between them.
+// Surface clicks that land within ~5% of a mesh vertex are snapped to that
+// vertex (cheaper to query than insert).
 //
 // Per click-pair the SignpostIntrinsicTriangulation is rebuilt from
-// scratch — flipOutPath mutates it in place, so reusing across runs would
-// give wrong results.
+// scratch — `flipOutPathFromSurfacePoints` inserts and flips, mutating it
+// in place; reusing across runs would give wrong results.
 
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
@@ -13,7 +15,8 @@ import {
   VertexPositionGeometry,
   SignpostIntrinsicTriangulation,
 } from '@chalkbag/flipout-ts';
-import { flipOutPath } from '@chalkbag/flipout-ts/flipout';
+import type { SurfacePoint } from '@chalkbag/flipout-ts';
+import { flipOutPathFromSurfacePoints } from '@chalkbag/flipout-ts/flipout';
 import { meshFromBufferGeometry, pathToBufferGeometry } from '@chalkbag/flipout-ts/three';
 
 // ---------------------------------------------------------------------------
@@ -55,7 +58,19 @@ interface TeapotJson {
 let teapotMesh: THREE.Mesh | null = null;
 let surfaceMesh: SurfaceMesh | null = null;
 let surfacePositions: [number, number, number][] | null = null;
+/**
+ * Map from "(a*nV + b*nV + c)" sorted-triple key → face index in the
+ * SurfaceMesh. Built once per loaded mesh so picks (which give
+ * (face.a, face.b, face.c) from Three.js) can be resolved to face indices
+ * in O(1) via a string key.
+ */
+let triangleKeyToFaceIndex: Map<string, number> | null = null;
 let bboxDiag = 1;
+
+function triKey(a: number, b: number, c: number): string {
+  const sorted = [a, b, c].sort((x, y) => x - y);
+  return `${sorted[0]},${sorted[1]},${sorted[2]}`;
+}
 
 const teapotMaterial = new THREE.MeshStandardMaterial({
   color: 0x9aa3b8,
@@ -124,6 +139,18 @@ async function loadMesh(name: string): Promise<void> {
   const r = meshFromBufferGeometry(geom);
   surfaceMesh = r.mesh;
   surfacePositions = r.positions as [number, number, number][];
+
+  // Build a (sorted vertex triple) -> face index lookup so we can map
+  // Three.js raycaster hits (which expose vertex indices, not face indices)
+  // back to flipout-ts face indices.
+  triangleKeyToFaceIndex = new Map();
+  for (let f = 0; f < surfaceMesh.nFaces; f++) {
+    const it = surfaceMesh.verticesOfFace(f);
+    const a = it.next().value as number;
+    const b = it.next().value as number;
+    const c = it.next().value as number;
+    triangleKeyToFaceIndex.set(triKey(a, b, c), f);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -132,8 +159,10 @@ async function loadMesh(name: string): Promise<void> {
 
 type State = 'idle' | 'awaiting-dst' | 'done';
 let state: State = 'idle';
-let srcVertex = -1;
-let dstVertex = -1;
+let srcPoint: SurfacePoint | null = null;
+let dstPoint: SurfacePoint | null = null;
+let srcWorld: [number, number, number] | null = null;
+let dstWorld: [number, number, number] | null = null;
 
 const statusEl = document.getElementById('status') as HTMLParagraphElement;
 const resetBtn = document.getElementById('reset') as HTMLButtonElement;
@@ -186,8 +215,10 @@ function clearAll(): void {
   srcMarker = null;
   dstMarker = null;
   pathLine = null;
-  srcVertex = -1;
-  dstVertex = -1;
+  srcPoint = null;
+  dstPoint = null;
+  srcWorld = null;
+  dstWorld = null;
   state = 'idle';
   setStatus('Click to set source.');
 }
@@ -203,25 +234,90 @@ resetBtn.addEventListener('click', () => {
 const raycaster = new THREE.Raycaster();
 const ndc = new THREE.Vector2();
 
-function pickVertex(clientX: number, clientY: number): number {
-  if (teapotMesh === null) return -1;
+/** Threshold above which a barycentric coord triggers a snap-to-vertex. */
+const VERTEX_SNAP_BARY = 0.95;
+
+interface PickResult {
+  point: SurfacePoint;
+  worldPos: [number, number, number];
+}
+
+/**
+ * Raycast the click into the mesh and return both a `SurfacePoint` and the
+ * exact 3D hit position. Snaps to the nearest vertex if the max bary coord
+ * exceeds {@link VERTEX_SNAP_BARY} (cheaper queries than a full insertion).
+ */
+function pickSurfacePoint(clientX: number, clientY: number): PickResult | null {
+  if (teapotMesh === null || surfaceMesh === null || triangleKeyToFaceIndex === null) {
+    return null;
+  }
   const rect = renderer.domElement.getBoundingClientRect();
   ndc.x = ((clientX - rect.left) / rect.width) * 2 - 1;
   ndc.y = -((clientY - rect.top) / rect.height) * 2 + 1;
   raycaster.setFromCamera(ndc, camera);
   const hits = raycaster.intersectObject(teapotMesh, false);
-  if (hits.length === 0) return -1;
+  if (hits.length === 0) return null;
   const hit = hits[0]!;
-  if (hit.face === null || hit.face === undefined || hit.barycoord === null || hit.barycoord === undefined) {
-    return -1;
+  if (
+    hit.face === null ||
+    hit.face === undefined ||
+    hit.barycoord === null ||
+    hit.barycoord === undefined
+  ) {
+    return null;
   }
-  // Pick the corner with the highest barycentric coordinate.
-  const bx = hit.barycoord.x;
-  const by = hit.barycoord.y;
-  const bz = hit.barycoord.z;
-  if (bx >= by && bx >= bz) return hit.face.a;
-  if (by >= bx && by >= bz) return hit.face.b;
-  return hit.face.c;
+  const worldPos: [number, number, number] = [hit.point.x, hit.point.y, hit.point.z];
+  const bary = hit.barycoord;
+  const bx = bary.x;
+  const by = bary.y;
+  const bz = bary.z;
+
+  // Snap to vertex if any bary coord is large enough.
+  if (bx >= VERTEX_SNAP_BARY) {
+    return { point: { kind: 'vertex', vertex: hit.face.a }, worldPos };
+  }
+  if (by >= VERTEX_SNAP_BARY) {
+    return { point: { kind: 'vertex', vertex: hit.face.b }, worldPos };
+  }
+  if (bz >= VERTEX_SNAP_BARY) {
+    return { point: { kind: 'vertex', vertex: hit.face.c }, worldPos };
+  }
+
+  // Otherwise: face-interior pick. Look up our SurfaceMesh face index.
+  const fIdx = triangleKeyToFaceIndex.get(triKey(hit.face.a, hit.face.b, hit.face.c));
+  if (fIdx === undefined) {
+    // Mesh built on a different triangle indexing — fall back to corner snap.
+    if (bx >= by && bx >= bz) return { point: { kind: 'vertex', vertex: hit.face.a }, worldPos };
+    if (by >= bx && by >= bz) return { point: { kind: 'vertex', vertex: hit.face.b }, worldPos };
+    return { point: { kind: 'vertex', vertex: hit.face.c }, worldPos };
+  }
+
+  // The barycentric order from Three.js is (a, b, c) which corresponds to
+  // the *vertex order in the BufferGeometry's index*. flipout-ts's
+  // `verticesOfFace(f)` returns vertices in CCW order — but the face
+  // construction in `meshFromBufferGeometry` uses the same triangle list,
+  // so corner ordering matches up.
+  //
+  // We need to map (a, b, c) bary coords to the order expected by
+  // flipout-ts's `insertVertex_face` (which is the order from
+  // `halfedgesAroundFace(f)`'s tail vertices).
+  const surfaceM = surfaceMesh;
+  const it = surfaceM.verticesOfFace(fIdx);
+  const v0 = it.next().value as number;
+  const v1 = it.next().value as number;
+  const v2 = it.next().value as number;
+  const baryByVertex = new Map<number, number>([
+    [hit.face.a, bx],
+    [hit.face.b, by],
+    [hit.face.c, bz],
+  ]);
+  const bIn0 = baryByVertex.get(v0) ?? 0;
+  const bIn1 = baryByVertex.get(v1) ?? 0;
+  const bIn2 = baryByVertex.get(v2) ?? 0;
+  return {
+    point: { kind: 'face', face: fIdx, bary: [bIn0, bIn1, bIn2] },
+    worldPos,
+  };
 }
 
 // We want pick-on-click but not on drag. Track pointerdown position; only
@@ -244,6 +340,28 @@ renderer.domElement.addEventListener('pointerup', (e) => {
   handleClick(e.clientX, e.clientY);
 });
 
+function describePoint(p: SurfacePoint): string {
+  if (p.kind === 'vertex') return `vertex ${p.vertex}`;
+  if (p.kind === 'edge') return `edge ${p.edge} t=${p.t.toFixed(3)}`;
+  const [b0, b1, b2] = p.bary;
+  return `face ${p.face} bary [${b0.toFixed(2)}, ${b1.toFixed(2)}, ${b2.toFixed(2)}]`;
+}
+
+function pointsEqual(a: SurfacePoint, b: SurfacePoint): boolean {
+  if (a.kind !== b.kind) return false;
+  if (a.kind === 'vertex' && b.kind === 'vertex') return a.vertex === b.vertex;
+  if (a.kind === 'edge' && b.kind === 'edge') return a.edge === b.edge && Math.abs(a.t - b.t) < 1e-9;
+  if (a.kind === 'face' && b.kind === 'face') {
+    return (
+      a.face === b.face &&
+      Math.abs(a.bary[0] - b.bary[0]) < 1e-9 &&
+      Math.abs(a.bary[1] - b.bary[1]) < 1e-9 &&
+      Math.abs(a.bary[2] - b.bary[2]) < 1e-9
+    );
+  }
+  return false;
+}
+
 function handleClick(clientX: number, clientY: number): void {
   if (surfaceMesh === null || surfacePositions === null) return;
 
@@ -252,30 +370,31 @@ function handleClick(clientX: number, clientY: number): void {
     clearAll();
   }
 
-  const v = pickVertex(clientX, clientY);
-  if (v < 0) return;
-  const pos = surfacePositions[v];
-  if (pos === undefined) return;
+  const pick = pickSurfacePoint(clientX, clientY);
+  if (pick === null) return;
 
   if (state === 'idle') {
-    srcVertex = v;
+    srcPoint = pick.point;
+    srcWorld = pick.worldPos;
     srcMarker = makeMarker(0x55ff77);
-    srcMarker.position.set(pos[0], pos[1], pos[2]);
+    srcMarker.position.set(pick.worldPos[0], pick.worldPos[1], pick.worldPos[2]);
     scene.add(srcMarker);
     state = 'awaiting-dst';
-    setStatus(`Source: v${v}. Click to set destination.`);
+    setStatus(`Source: ${describePoint(pick.point)}. Click to set destination.`);
     return;
   }
 
   if (state === 'awaiting-dst') {
-    if (v === srcVertex) {
-      // Same vertex — no path. Keep waiting for a different destination.
-      setStatus(`Source: v${v}. Pick a *different* vertex for the destination.`);
+    if (srcPoint !== null && pointsEqual(srcPoint, pick.point)) {
+      setStatus(
+        `Source: ${describePoint(srcPoint)}. Pick a *different* point for the destination.`,
+      );
       return;
     }
-    dstVertex = v;
+    dstPoint = pick.point;
+    dstWorld = pick.worldPos;
     dstMarker = makeMarker(0xff77aa);
-    dstMarker.position.set(pos[0], pos[1], pos[2]);
+    dstMarker.position.set(pick.worldPos[0], pick.worldPos[1], pick.worldPos[2]);
     scene.add(dstMarker);
     runFlipOut();
     state = 'done';
@@ -288,16 +407,17 @@ function handleClick(clientX: number, clientY: number): void {
 
 function runFlipOut(): void {
   if (surfaceMesh === null || surfacePositions === null) return;
-  if (srcVertex < 0 || dstVertex < 0) return;
+  if (srcPoint === null || dstPoint === null) return;
 
-  setStatus(`Computing geodesic v${srcVertex} -> v${dstVertex}...`);
+  setStatus(`Computing geodesic ${describePoint(srcPoint)} -> ${describePoint(dstPoint)}...`);
 
   let result;
   try {
-    // Rebuild intrinsic triangulation per click-pair (flipOutPath mutates).
+    // Rebuild intrinsic triangulation per click-pair (insertions + flips
+    // mutate it in place, so reuse would corrupt subsequent queries).
     const geom = new VertexPositionGeometry(surfaceMesh, surfacePositions);
     const intrinsic = new SignpostIntrinsicTriangulation(geom);
-    result = flipOutPath(intrinsic, srcVertex, dstVertex);
+    result = flipOutPathFromSurfacePoints(intrinsic, srcPoint, dstPoint);
   } catch (err) {
     setStatus(`Error: ${err instanceof Error ? err.message : String(err)}`);
     return;
@@ -315,6 +435,8 @@ function runFlipOut(): void {
 
   const lengthStr = result.length.toFixed(4);
   const conv = result.converged ? '✓ converged' : '✗ did not converge';
+  void srcWorld;
+  void dstWorld;
   setStatus(
     `Geodesic length: ${lengthStr} (${result.iterations} iters, ${conv}). Click to reset.`,
   );

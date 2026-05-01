@@ -11,5 +11,11 @@
 //
 //   import { FlipEdgeNetwork, flipOutPath } from '@chalkbag/flipout-ts/flipout';
 
-export { FlipEdgeNetwork, flipOutPath, SegmentAngleType } from './flip-edge-network.js';
+export {
+  FlipEdgeNetwork,
+  flipOutPath,
+  flipOutPathFromSurfacePoints,
+  SegmentAngleType,
+  SNAP_EPS,
+} from './flip-edge-network.js';
 export { shortestEdgePath } from './dijkstra.js';

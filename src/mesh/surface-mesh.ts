@@ -60,24 +60,25 @@ export type Triangle = readonly [number, number, number];
  */
 export class SurfaceMesh {
   // ---------------------------------------------------------------------------
-  // Connectivity arrays. All read-only after construction except inside
-  // `flipEdge` and similar mutation methods.
+  // Connectivity arrays. Held by reference and grown in place by the
+  // vertex-insertion mutations (`splitEdgeTriangular`, `splitFace`). The
+  // edge-flip mutation only mutates entries — it never grows the arrays.
   // ---------------------------------------------------------------------------
 
   /** Tail (origin) vertex of each halfedge. Length: `nHalfedges`. */
-  private readonly heVertexArr: Int32Array;
+  private heVertexArr: Int32Array;
   /** Next halfedge in face cycle (CCW). Length: `nHalfedges`. */
-  private readonly heNextArr: Int32Array;
+  private heNextArr: Int32Array;
   /** Face on the left of each halfedge, or `INVALID_INDEX` on boundary. */
-  private readonly heFaceArr: Int32Array;
+  private heFaceArr: Int32Array;
   /** Some outgoing halfedge for each vertex. Length: `nVertices`. */
-  private readonly vHalfedgeArr: Int32Array;
+  private vHalfedgeArr: Int32Array;
   /** Some halfedge bordering each face. Length: `nFaces`. */
-  private readonly fHalfedgeArr: Int32Array;
+  private fHalfedgeArr: Int32Array;
 
-  private readonly _nVertices: number;
-  private readonly _nFaces: number;
-  private readonly _nHalfedges: number;
+  private _nVertices: number;
+  private _nFaces: number;
+  private _nHalfedges: number;
 
   private constructor(
     heVertexArr: Int32Array,
@@ -689,6 +690,422 @@ export class SurfaceMesh {
     this.heFaceArr[hb3] = fa;
 
     return true;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Mutations: vertex insertion. Ported from geometry-central:
+  //   src/surface/manifold_surface_mesh.cpp::splitEdgeTriangular
+  //   src/surface/manifold_surface_mesh.cpp::insertVertexAlongEdge
+  //   src/surface/manifold_surface_mesh.cpp::connectVertices
+  //   src/surface/manifold_surface_mesh.cpp::insertVertex
+  //
+  // These add new vertices, edges, faces, and halfedges to an existing mesh
+  // by growing the underlying typed arrays in place. The combinatorial
+  // bookkeeping mirrors gc's primitives; the L3 layer (signposts, lengths)
+  // is responsible for filling in geometric data for the new elements.
+  //
+  // All new vertex/edge/face/halfedge indices are appended to the end of
+  // their respective ranges (no reuse of holes — gc's mesh has a "compress"
+  // path for that, but our array layout is dense so we only ever append).
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Grow `heVertexArr` / `heNextArr` / `heFaceArr` by `extra` halfedge slots.
+   * Extra slots are initialised to `INVALID_INDEX`.
+   */
+  private growHalfedgeArrays(extra: number): void {
+    const newLen = this._nHalfedges + extra;
+    const newV = new Int32Array(newLen);
+    const newN = new Int32Array(newLen);
+    const newF = new Int32Array(newLen);
+    newV.set(this.heVertexArr);
+    newN.set(this.heNextArr);
+    newF.set(this.heFaceArr);
+    for (let i = this._nHalfedges; i < newLen; i++) {
+      newV[i] = INVALID_INDEX;
+      newN[i] = INVALID_INDEX;
+      newF[i] = INVALID_INDEX;
+    }
+    this.heVertexArr = newV;
+    this.heNextArr = newN;
+    this.heFaceArr = newF;
+    this._nHalfedges = newLen;
+  }
+
+  /** Grow `vHalfedgeArr` by 1 vertex slot, returning its new index. */
+  private addVertex(): number {
+    const v = this._nVertices;
+    const grown = new Int32Array(v + 1);
+    grown.set(this.vHalfedgeArr);
+    grown[v] = INVALID_INDEX;
+    this.vHalfedgeArr = grown;
+    this._nVertices = v + 1;
+    return v;
+  }
+
+  /** Grow `fHalfedgeArr` by 1 face slot, returning its new index. */
+  private addFace(): number {
+    const f = this._nFaces;
+    const grown = new Int32Array(f + 1);
+    grown.set(this.fHalfedgeArr);
+    grown[f] = INVALID_INDEX;
+    this.fHalfedgeArr = grown;
+    this._nFaces = f + 1;
+    return f;
+  }
+
+  /**
+   * Allocate a fresh edge — i.e. two paired halfedges (he, he^1). Returns the
+   * even halfedge id; the odd id is `+ 1`. Mirrors `getNewEdgeTriple` from gc:
+   * we grow the halfedge arrays by 2 so `he ^ 1` lands on the partner.
+   */
+  private addEdge(): number {
+    const he = this._nHalfedges;
+    this.growHalfedgeArrays(2);
+    return he;
+  }
+
+  /**
+   * In-place combinatorial split of edge `e`. Both incident faces (or one,
+   * if `e` is a boundary edge) must be triangles. Inserts a new vertex
+   * subdividing `e`, then connects it to the opposite vertex of each
+   * triangle, producing two (or one) new triangles per side.
+   *
+   * Direct port of `ManifoldSurfaceMesh::splitEdgeTriangular`
+   * (`manifold_surface_mesh.cpp`):
+   *
+   *     Halfedge splitEdgeTriangular(Edge e) {
+   *       Halfedge he = insertVertexAlongEdge(e);
+   *       { Halfedge heOther = he.next().next(); connectVertices(he, heOther); }
+   *       if (he.twin().isInterior()) {
+   *         Halfedge heFirst = he.twin().next();
+   *         Halfedge heOther = heFirst.next().next();
+   *         connectVertices(heFirst, heOther);
+   *       }
+   *       return he;
+   *     }
+   *
+   * Net change for an interior edge:
+   *   +1 vertex, +3 edges, +2 faces, +6 halfedges
+   * (2 from `insertVertexAlongEdge`, 2 per `connectVertices` call × 2 sides)
+   *
+   * Net change for a boundary edge:
+   *   +1 vertex, +2 edges, +1 face, +4 halfedges.
+   *
+   * Returns the new vertex index plus the four (or three) new outgoing
+   * halfedges from the new vertex (in CCW order around it).
+   */
+  splitEdgeTriangular(e: number): { newVertex: number; newHalfedgesFromNew: number[] } {
+    if (e < 0 || e >= this.nEdges) {
+      throw new RangeError(`edge ${e} out of range [0, ${this.nEdges})`);
+    }
+
+    const heACenter = this.edgeHalfedge(e);
+    const heBCenter = this.twin(heACenter);
+    const isBoundaryE = this.isBoundaryEdge(e);
+    const isInteriorA = !this.isBoundaryHalfedge(heACenter);
+    const isInteriorB = !this.isBoundaryHalfedge(heBCenter);
+
+    // Triangularity check (only on the interior side(s)).
+    if (isInteriorA) {
+      const fa = this.heFaceArr[heACenter]!;
+      if (this.faceDegree(fa) !== 3) {
+        throw new Error(`splitEdgeTriangular: face ${fa} of edge ${e} is not a triangle`);
+      }
+    }
+    if (isInteriorB) {
+      const fb = this.heFaceArr[heBCenter]!;
+      if (this.faceDegree(fb) !== 3) {
+        throw new Error(`splitEdgeTriangular: face ${fb} of edge ${e} is not a triangle`);
+      }
+    }
+
+    // ----- Phase 1: insertVertexAlongEdge ------------------------------------
+    // Mirrors gc's `insertVertexAlongEdge`. Splits the edge into two by
+    // inserting a vertex and one new edge; old half-edges keep their slots
+    // but their tail/next get rewired so the original `heACenter` now starts
+    // at the new vertex, and a fresh `heANew` (with twin `heBNew`) starts at
+    // the original tail.
+
+    // Save references before we mutate anything.
+    const heANext = this.heNextArr[heACenter]!;
+    const heBNext = this.heNextArr[heBCenter]!;
+    // heAPrev = predecessor of heACenter inside its face cycle. For a
+    // triangle with halfedges (heACenter, heANext, heAPrev), heAPrev =
+    // next(heANext).
+    let heAPrev = -1;
+    if (isInteriorA) heAPrev = this.heNextArr[heANext]!;
+    const fA = isInteriorA ? this.heFaceArr[heACenter]! : INVALID_INDEX;
+    const fB = isInteriorB ? this.heFaceArr[heBCenter]! : INVALID_INDEX;
+    const oldVBottom = this.heVertexArr[heACenter]!;
+    const oldVBottomHe = this.vHalfedgeArr[oldVBottom]!;
+
+    // Allocate new vertex + edge.
+    const newV = this.addVertex();
+    const heANew = this.addEdge();
+    const heBNew = heANew ^ 1;
+
+    // New vertex's outgoing halfedge anchor: heACenter (which after the
+    // rewire starts at newV). For boundary case where heBCenter is the
+    // boundary halfedge entering newV from the other side, gc's L1
+    // boundary fix-up wants vHalfedge[boundaryVertex] = first interior
+    // outgoing — and `heACenter` (which is the interior side, since `e`
+    // is on the boundary => `heACenter` is interior, `heBCenter` is the
+    // boundary) is exactly that.
+    this.vHalfedgeArr[newV] = heACenter;
+
+    // heANew: same tail as before (oldVBottom), face fA, next = heACenter.
+    this.heVertexArr[heANew] = oldVBottom;
+    this.heNextArr[heANew] = heACenter;
+    this.heFaceArr[heANew] = fA;
+
+    // heBNew: tail = newV, face fB, next = heBNext.
+    this.heVertexArr[heBNew] = newV;
+    this.heNextArr[heBNew] = heBNext;
+    this.heFaceArr[heBNew] = fB;
+
+    // Fix old halfedges:
+    //   - heBCenter's next is now heBNew.
+    //   - heAPrev's next is now heANew (only if interior side A).
+    //   - heACenter's tail is now newV.
+    this.heNextArr[heBCenter] = heBNew;
+    if (isInteriorA) this.heNextArr[heAPrev] = heANew;
+    this.heVertexArr[heACenter] = newV;
+
+    // Preserve oldVBottom's vertexHalfedge invariant. If it was pointing at
+    // heACenter (which now starts at newV), reroute to heANew.
+    if (oldVBottomHe === heACenter) {
+      this.vHalfedgeArr[oldVBottom] = heANew;
+    }
+
+    // ----- Phase 2: connectVertices on each interior side --------------------
+    // Each call adds 1 edge + 1 face and rewires within the (now-quad)
+    // face to produce two triangles.
+
+    let newHeOnSideA = -1; // halfedge from newV toward the opposite vertex on side A
+    let newHeOnSideB = -1; // halfedge from newV toward the opposite vertex on side B
+    void heANext; void heBNext; // referenced only via cycle walk below
+
+    if (isInteriorA) {
+      // After phase 1, the face fA has cycle: heACenter -> heANext -> heAPrev -> heANew -> heACenter.
+      // heOther = he.next().next() = heAPrev (in this cycle): start of heACenter is newV,
+      // start of heAPrev is the opposite (apex) vertex. So `connectVertices(heACenter, heAPrev)`
+      // creates the diagonal newV -> apex.
+      const heOther = this.heNextArr[this.heNextArr[heACenter]!]!;
+      const created = this.connectVertices_(heACenter, heOther, fA);
+      newHeOnSideA = created;
+    }
+
+    if (isInteriorB) {
+      // gc:
+      //   heFirst = he.twin().next()       // where he = heACenter (returned from insertVertexAlongEdge)
+      //   heOther = heFirst.next().next()
+      //   connectVertices(heFirst, heOther)
+      //
+      // After phase 1, heBCenter's next was rewired to heBNew, so
+      // `heACenter.twin().next() = heBCenter.next() = heBNew`. Thus
+      // heFirst = heBNew, whose tail is newV. heOther = heFirst.next().next()
+      // which lands on the boundary halfedge of face fB whose tail is the
+      // apex (the third vertex of the original triangle face fB).
+      const heFirst = heBNew;
+      const heOther = this.heNextArr[this.heNextArr[heFirst]!]!;
+      const created = this.connectVertices_(heFirst, heOther, fB);
+      // `created` runs from heFirst.tail = newV outward, exactly what we want.
+      newHeOnSideB = created;
+    }
+
+    // ----- Phase 3: collect outgoing halfedges from newV ---------------------
+    // Iterate around newV using the CCW step. Should produce 4 halfedges
+    // (interior case) or 3 (boundary case: 2 interior + 1 boundary).
+    const outgoing: number[] = [];
+    {
+      const first = this.vHalfedgeArr[newV]!;
+      let curr = first;
+      let safety = 0;
+      do {
+        outgoing.push(curr);
+        if (this.heFaceArr[curr] === INVALID_INDEX) break;
+        curr = this.heNextArr[this.heNextArr[curr]!]! ^ 1;
+        if (++safety > 32) {
+          throw new Error('splitEdgeTriangular: vertex orbit at new vertex did not terminate');
+        }
+      } while (curr !== first);
+    }
+
+    void newHeOnSideA;
+    void newHeOnSideB;
+    void isBoundaryE;
+
+    return { newVertex: newV, newHalfedgesFromNew: outgoing };
+  }
+
+  /**
+   * Internal `connectVertices(heA, heB, fA)` — direct port of
+   * `ManifoldSurfaceMesh::connectVertices`. Both halfedges must lie inside
+   * the same face `fA`, must not be adjacent in the face cycle, and must
+   * differ. Adds a new edge with halfedges (heANew, heBNew) plus a new
+   * face fB; halfedges along the cycle from heA to heBNew become bordered
+   * by fB.
+   *
+   * Returns the new halfedge `heANew` (whose tail is `vertex(heA)` and
+   * whose face is fA).
+   */
+  private connectVertices_(heA: number, heB: number, fA: number): number {
+    const vA = this.heVertexArr[heA]!;
+    const vB = this.heVertexArr[heB]!;
+
+    // Predecessors in the face cycle (they will rewire to point at the new edge).
+    // For a quad cycle, prev = next(next(next(...))). We just walk forward.
+    const heAPrev = this.findPrevInFace(heA);
+    const heBPrev = this.findPrevInFace(heB);
+
+    const heANew = this.addEdge();
+    const heBNew = heANew ^ 1;
+    const fB = this.addFace();
+
+    // Faces
+    this.fHalfedgeArr[fA] = heANew;
+    this.fHalfedgeArr[fB] = heBNew;
+
+    // New halfedges
+    this.heVertexArr[heANew] = vA;
+    this.heNextArr[heANew] = heB;
+    this.heFaceArr[heANew] = fA;
+
+    this.heVertexArr[heBNew] = vB;
+    this.heNextArr[heBNew] = heA;
+    this.heFaceArr[heBNew] = fB;
+
+    // Stitch into existing cycles
+    this.heNextArr[heAPrev] = heANew;
+    this.heNextArr[heBPrev] = heBNew;
+
+    // Reassign face owner for the half of the cycle now bounded by fB:
+    // walk from heA forward until we reach heBNew.
+    let curr = heA;
+    let safety = 0;
+    while (curr !== heBNew) {
+      this.heFaceArr[curr] = fB;
+      curr = this.heNextArr[curr]!;
+      if (++safety > 32) {
+        throw new Error('connectVertices: face cycle walk did not terminate');
+      }
+    }
+
+    return heANew;
+  }
+
+  /** Predecessor of `he` along its face's `next` cycle. O(faceDegree). */
+  private findPrevInFace(he: number): number {
+    let curr = he;
+    let safety = 0;
+    while (true) {
+      const n = this.heNextArr[curr]!;
+      if (n === he) return curr;
+      curr = n;
+      if (++safety > 64) {
+        throw new Error(`findPrevInFace: cycle from ${he} did not close`);
+      }
+    }
+  }
+
+  /**
+   * In-place combinatorial face-vertex insertion. The face must be a
+   * triangle (gc's general routine works on any polygon, but we only need
+   * the triangle case for L3). Inserts a new vertex inside `f` and replaces
+   * `f` with three triangles fanning from the new vertex to the three
+   * existing corners.
+   *
+   * Direct port of `ManifoldSurfaceMesh::insertVertex` for the triangle case
+   * (`manifold_surface_mesh.cpp`).
+   *
+   * Net change: +1 vertex, +3 edges, +2 faces (3 new minus 1 old), +6 halfedges.
+   *
+   * Returns the new vertex index plus the three outgoing halfedges from the
+   * new vertex (in CCW order around it).
+   */
+  splitFace(f: number): { newVertex: number; newHalfedgesFromNew: number[] } {
+    if (f < 0 || f >= this.nFaces) {
+      throw new RangeError(`face ${f} out of range [0, ${this.nFaces})`);
+    }
+    if (this.faceDegree(f) !== 3) {
+      throw new Error(`splitFace: face ${f} is not a triangle`);
+    }
+
+    // Gather the three boundary halfedges of `f` BEFORE mutating anything.
+    const h0 = this.faceHalfedge(f);
+    const h1 = this.heNextArr[h0]!;
+    const h2 = this.heNextArr[h1]!;
+    const boundary = [h0, h1, h2];
+
+    // Allocate the center vertex.
+    const centerV = this.addVertex();
+
+    // Allocate three new edges (each `addEdge` grows by two halfedges):
+    //   leadingHalfedges[i] points TOWARD the center from the tip of boundary[i]
+    //   trailingHalfedges[i] points OUTWARD from the center to vertex(boundary[i])
+    // Convention (matches gc): leadingHalfedges[i].twin() = trailingHalfedges[(i+1) % 3]
+    // because trailing[(i+1)%3] starts at the same vertex (tip of boundary[i] =
+    // tail of boundary[(i+1)%3]).
+    const leading: number[] = [];
+    const trailing: number[] = new Array(3);
+    for (let i = 0; i < 3; i++) {
+      const heL = this.addEdge();
+      leading.push(heL);
+      trailing[(i + 1) % 3] = heL ^ 1;
+    }
+
+    // Allocate two new faces (the third re-uses `f` as in gc's insertVertex).
+    const innerFaces = [f, this.addFace(), this.addFace()];
+
+    // Wire up.
+    for (let i = 0; i < 3; i++) {
+      const fi = innerFaces[i]!;
+      const leadingHe = leading[i]!;
+      const trailingHe = trailing[i]!;
+      const boundaryHe = boundary[i]!;
+
+      // Face anchor: any of the three halfedges of fi will do.
+      this.fHalfedgeArr[fi] = boundaryHe;
+
+      // leadingHe: tail = tip of boundaryHe = vertex(boundary[(i+1)%3]),
+      //            face = fi, next = trailingHe.
+      this.heVertexArr[leadingHe] = this.heVertexArr[boundary[(i + 1) % 3]!]!;
+      this.heNextArr[leadingHe] = trailingHe;
+      this.heFaceArr[leadingHe] = fi;
+
+      // trailingHe: tail = centerV, face = fi, next = boundaryHe.
+      this.heVertexArr[trailingHe] = centerV;
+      this.heNextArr[trailingHe] = boundaryHe;
+      this.heFaceArr[trailingHe] = fi;
+
+      // boundaryHe: face = fi, next = leadingHe.
+      this.heFaceArr[boundaryHe] = fi;
+      this.heNextArr[boundaryHe] = leadingHe;
+    }
+
+    // Center vertex anchor: any of its trailing halfedges. Use trailing[0]
+    // (interior — splitFace operates on interior faces only).
+    this.vHalfedgeArr[centerV] = trailing[0]!;
+
+    // Outgoing halfedges from the new vertex are the three trailings.
+    // Iterate to make sure they come out in CCW order matching the existing
+    // vertex orbit convention.
+    const outgoing: number[] = [];
+    {
+      const first = this.vHalfedgeArr[centerV]!;
+      let curr = first;
+      let safety = 0;
+      do {
+        outgoing.push(curr);
+        curr = this.heNextArr[this.heNextArr[curr]!]! ^ 1;
+        if (++safety > 16) {
+          throw new Error('splitFace: vertex orbit at new vertex did not terminate');
+        }
+      } while (curr !== first);
+    }
+
+    return { newVertex: centerV, newHalfedgesFromNew: outgoing };
   }
 }
 

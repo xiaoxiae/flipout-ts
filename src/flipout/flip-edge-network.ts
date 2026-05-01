@@ -27,7 +27,10 @@
 // comments next to each method for the gc function it mirrors.
 
 import type { Vec3 } from '../math/vec3.js';
-import type { SignpostIntrinsicTriangulation } from '../intrinsic/signpost-intrinsic-triangulation.js';
+import type {
+  SignpostIntrinsicTriangulation,
+  SurfacePoint,
+} from '../intrinsic/signpost-intrinsic-triangulation.js';
 import { shortestEdgePath } from './dijkstra.js';
 
 /** gc's `SegmentAngleType`. `Shortest` means the wedge is locally straight. */
@@ -673,6 +676,210 @@ export function flipOutPath(
   const network = new FlipEdgeNetwork(intrinsic, initial);
   const { iterations, converged } = network.flipOut(options.maxIterations ?? 100000);
   const polyline = network.extractPolyline();
+  const length = network.pathLength();
+  return { polyline, length, iterations, converged };
+}
+
+// ===========================================================================
+// flipOutPathFromSurfacePoints — extension over `flipOutPath` that accepts
+// arbitrary surface points (vertex / edge / face). Source and destination
+// points that are not at existing vertices are inserted into the intrinsic
+// triangulation via L3's `insertVertex_*` before running the standard
+// FlipOut algorithm.
+//
+// The intrinsic triangulation is mutated in place by both insertion and
+// flipping. Callers should construct a fresh `SignpostIntrinsicTriangulation`
+// per path query (same constraint as `flipOutPath`).
+// ===========================================================================
+
+/** Snap policy: if a barycentric / edge t lands within this epsilon of an
+ *  existing vertex, snap to that vertex instead of inserting. */
+export const SNAP_EPS = 1e-9;
+
+/**
+ * Resolve a `SurfacePoint` to an intrinsic vertex index, inserting a new
+ * intrinsic vertex if needed. Snaps to an existing vertex when the point
+ * is within {@link SNAP_EPS} of one (max bary coord > 1 - eps for face,
+ * t < eps or t > 1 - eps for edge).
+ */
+function resolveSurfacePoint(
+  intrinsic: SignpostIntrinsicTriangulation,
+  point: SurfacePoint,
+): number {
+  if (point.kind === 'vertex') {
+    return point.vertex;
+  }
+  if (point.kind === 'edge') {
+    return intrinsic.insertVertex_edge(point.edge, point.t);
+  }
+  // face
+  return intrinsic.insertVertex_face(point.face, point.bary);
+}
+
+/**
+ * Trace one path segment's geodesic across the input mesh to produce a 3D
+ * polyline. Handles three cases:
+ *
+ *   1. Both endpoints are *original* input-mesh vertices — uses the
+ *      existing `tracePolylineFromVertex` from the tail.
+ *   2. The tail is an inserted vertex but the tip is original — traces
+ *      *backwards* from the tip along `twin(seg.he)`, then reverses the
+ *      output. The first point (after reversal) is the inserted vertex's
+ *      stored 3D position; we replace it with the exact stored value to
+ *      avoid FP drift between the trace endpoint and the stored position.
+ *   3. The tip is an inserted vertex but the tail is original — traces
+ *      forward from the tail; the trace's endpoint is the inserted
+ *      vertex's stored position; we replace it with the exact stored value.
+ *
+ * Case "both inserted" is impossible for a path of length ≥ 2 (we only
+ * ever insert at most two vertices and they're never adjacent unless the
+ * path itself has length 1, which we handle explicitly in the caller).
+ */
+function traceSegmentPolyline(
+  intrinsic: SignpostIntrinsicTriangulation,
+  segHe: number,
+  insertedSrcV: number,
+  insertedDstV: number,
+): Vec3[] {
+  const im = intrinsic.intrinsicMesh;
+  const tail = im.vertex(segHe);
+  const tip = im.tipVertex(segHe);
+  const insertedSet = new Set<number>();
+  if (insertedSrcV >= 0) insertedSet.add(insertedSrcV);
+  if (insertedDstV >= 0) insertedSet.add(insertedDstV);
+  const tailIsInserted = insertedSet.has(tail);
+  const tipIsInserted = insertedSet.has(tip);
+
+  const len = intrinsic.edgeLengths[im.edge(segHe)]!;
+
+  if (!tailIsInserted && !tipIsInserted) {
+    // Standard case — both endpoints are original. Trace from tail.
+    const rawAngle = intrinsic.halfedgeSignposts[segHe]!;
+    const rescaled = rawAngle / intrinsic.vertexAngleScaling(tail);
+    return intrinsic.tracePolylineFromVertex(tail, rescaled, len);
+  }
+
+  if (!tailIsInserted && tipIsInserted) {
+    // Trace forward from tail; final endpoint is the inserted dst — use
+    // its stored 3D position to land exactly there.
+    const rawAngle = intrinsic.halfedgeSignposts[segHe]!;
+    const rescaled = rawAngle / intrinsic.vertexAngleScaling(tail);
+    const out = intrinsic.tracePolylineFromVertex(tail, rescaled, len);
+    const tipLoc = intrinsic.insertedVertexLocations.get(tip);
+    if (tipLoc !== undefined && out.length > 0) {
+      out[out.length - 1] = intrinsic.surfacePointPosition(tipLoc);
+    }
+    return out;
+  }
+
+  if (tailIsInserted && !tipIsInserted) {
+    // Trace from tip backward along twin, then reverse.
+    const heTwin = im.twin(segHe);
+    const rawAngle = intrinsic.halfedgeSignposts[heTwin]!;
+    const rescaled = rawAngle / intrinsic.vertexAngleScaling(tip);
+    const out = intrinsic.tracePolylineFromVertex(tip, rescaled, len);
+    out.reverse();
+    const tailLoc = intrinsic.insertedVertexLocations.get(tail);
+    if (tailLoc !== undefined && out.length > 0) {
+      out[0] = intrinsic.surfacePointPosition(tailLoc);
+    }
+    return out;
+  }
+
+  // Both endpoints inserted. Path is a single segment from src to dst — we
+  // can't easily trace this through the input mesh because both endpoints
+  // are face/edge interiors. As a degenerate fallback, return a straight
+  // line between the two stored 3D positions (correct only when src and
+  // dst are coplanar in some input face).
+  const tailLoc = intrinsic.insertedVertexLocations.get(tail);
+  const tipLoc = intrinsic.insertedVertexLocations.get(tip);
+  const pa = tailLoc ? intrinsic.surfacePointPosition(tailLoc) : [0, 0, 0];
+  const pb = tipLoc ? intrinsic.surfacePointPosition(tipLoc) : [0, 0, 0];
+  return [pa as Vec3, pb as Vec3];
+}
+
+/**
+ * Stitch per-segment 3D polylines into a single deduplicated 3D polyline.
+ * Drops the first point of each segment if it duplicates the previous
+ * segment's last point (within FP tolerance).
+ */
+function concatPolylines(parts: Vec3[][]): Vec3[] {
+  const out: Vec3[] = [];
+  for (const part of parts) {
+    if (part.length === 0) continue;
+    if (out.length === 0) {
+      out.push(...part);
+    } else {
+      const last = out[out.length - 1]!;
+      const first = part[0]!;
+      const same =
+        Math.abs(last[0] - first[0]) < 1e-9 &&
+        Math.abs(last[1] - first[1]) < 1e-9 &&
+        Math.abs(last[2] - first[2]) < 1e-9;
+      const startIdx = same ? 1 : 0;
+      for (let i = startIdx; i < part.length; i++) out.push(part[i]!);
+    }
+  }
+  return out;
+}
+
+/**
+ * High-level convenience: same as {@link flipOutPath} but accepts arbitrary
+ * surface points (vertex / edge / face) for the source and destination.
+ *
+ * Steps:
+ *   1. Resolve `src` / `dst` to intrinsic vertex indices, inserting new
+ *      intrinsic vertices via L3's `insertVertex_face` / `insertVertex_edge`
+ *      if needed. Snapping to an existing vertex happens within {@link SNAP_EPS}.
+ *   2. Build a Dijkstra path on the (now updated) intrinsic edge graph.
+ *   3. Run FlipOut.
+ *   4. Extract a 3D polyline that begins at `src`'s stored 3D position
+ *      and ends at `dst`'s stored 3D position, with intermediate
+ *      face-crossing points along the geodesic.
+ *
+ * Returns `{ polyline, length, iterations, converged }` exactly like
+ * {@link flipOutPath}.
+ */
+export function flipOutPathFromSurfacePoints(
+  intrinsic: SignpostIntrinsicTriangulation,
+  src: SurfacePoint,
+  dst: SurfacePoint,
+  options: { maxIterations?: number } = {},
+): { polyline: Vec3[]; length: number; iterations: number; converged: boolean } {
+  // Track which (if any) vertices were freshly inserted so the polyline
+  // tracer knows when to use stored 3D positions instead of input-mesh
+  // vertex positions.
+  const wasInsertedSrc = src.kind !== 'vertex';
+  const wasInsertedDst = dst.kind !== 'vertex';
+
+  const vSrc = resolveSurfacePoint(intrinsic, src);
+  const vDst = resolveSurfacePoint(intrinsic, dst);
+
+  // After resolution, snapping may have put us on the same vertex — refuse.
+  if (vSrc === vDst) {
+    throw new Error(
+      `flipOutPathFromSurfacePoints: source and destination resolved to the same vertex (${vSrc})`,
+    );
+  }
+
+  const insertedSrcV = wasInsertedSrc && vSrc >= intrinsic.inputGeometry.mesh.nVertices ? vSrc : -1;
+  const insertedDstV = wasInsertedDst && vDst >= intrinsic.inputGeometry.mesh.nVertices ? vDst : -1;
+
+  const initial = shortestEdgePath(intrinsic, vSrc, vDst);
+  if (initial === null) {
+    throw new Error(
+      `flipOutPathFromSurfacePoints: no path from vertex ${vSrc} to vertex ${vDst}`,
+    );
+  }
+  const network = new FlipEdgeNetwork(intrinsic, initial);
+  const { iterations, converged } = network.flipOut(options.maxIterations ?? 100000);
+
+  // Per-segment polyline with custom handling of inserted endpoints.
+  const segHEs = network.pathHalfedges();
+  const parts: Vec3[][] = segHEs.map((he) =>
+    traceSegmentPolyline(intrinsic, he, insertedSrcV, insertedDstV),
+  );
+  const polyline = concatPolylines(parts);
   const length = network.pathLength();
   return { polyline, length, iterations, converged };
 }
