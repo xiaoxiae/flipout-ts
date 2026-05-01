@@ -27,7 +27,7 @@
     "type": "git",
     "url": "git+https://github.com/xiaoxiae/flipout-ts.git"
   },
-  "homepage": "https://flipout.slama.dev",
+  "homepage": "https://flipout-ts.slama.dev",
   "bugs": {
     "url": "https://github.com/xiaoxiae/flipout-ts/issues"
   },

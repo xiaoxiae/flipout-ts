@@ -7,7 +7,7 @@ ported from the C++ reference in
 [geometry-central](https://github.com/nmwsharp/geometry-central) (MIT).
 Has an optional Three.js adapter.
 
-There is a [live demo](https://flipout.slama.dev).
+There is a [live demo](https://flipout-ts.slama.dev).
 
 ![FlipOut demo: geodesic path on the Utah teapot](./assets/demo.png)
 

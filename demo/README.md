@@ -1,7 +1,7 @@
 # flipout-ts demo
 
 Interactive Three.js demo of the FlipOut geodesic algorithm. Live at
-[flipout.slama.dev](https://flipout.slama.dev).
+[flipout-ts.slama.dev](https://flipout-ts.slama.dev).
 
 ## Run locally
 
