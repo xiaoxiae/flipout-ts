@@ -1,0 +1,3 @@
+[submodule "tools/gen_bezier_fixtures/extern/geometry-central"]
+	path = tools/gen_bezier_fixtures/extern/geometry-central
+	url = https://github.com/nmwsharp/geometry-central.git

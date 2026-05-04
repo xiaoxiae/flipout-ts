@@ -27,7 +27,7 @@ function dist3(a: Vec3, b: Vec3): number {
 }
 
 describe('golden fixtures — length', () => {
-  for (const name of listFixtures()) {
+  for (const name of listFixtures('geodesic')) {
     it(`${name}: length matches potpourri3d to 4 decimal places`, () => {
       const f = loadFixture(name);
       const mesh = SurfaceMesh.fromFaces(f.mesh.faces, f.mesh.vertices.length);
@@ -41,7 +41,7 @@ describe('golden fixtures — length', () => {
 });
 
 describe('golden fixtures — endpoint positions', () => {
-  for (const name of listFixtures()) {
+  for (const name of listFixtures('geodesic')) {
     it(`${name}: polyline starts/ends at the source/destination 3D positions`, () => {
       const f = loadFixture(name);
       const mesh = SurfaceMesh.fromFaces(f.mesh.faces, f.mesh.vertices.length);
@@ -58,7 +58,7 @@ describe('golden fixtures — endpoint positions', () => {
 });
 
 describe('golden fixtures — polyline equality (when point counts match)', () => {
-  for (const name of listFixtures()) {
+  for (const name of listFixtures('geodesic')) {
     if (name.startsWith('teapot')) continue; // skip slow / complex cases
     it(`${name}: per-point distance ≤ 1e-3 if counts match`, () => {
       const f = loadFixture(name);

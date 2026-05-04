@@ -204,10 +204,21 @@ export class SignpostIntrinsicTriangulation {
 
     // Vertex angle sums (from extrinsic geometry — they are intrinsic
     // invariants of the surface, computable from edge lengths alone).
+    //
+    // gc accumulates by iterating *corners in index order globally* (i.e.
+    // halfedges 0..N-1), summing each corner's angle into its tail vertex.
+    // We mirror that summation order exactly — iterating per-vertex would
+    // accumulate the same set of corner angles in a different sequence,
+    // producing 1-ulp drift on the running sum that compounds through every
+    // downstream signpost computation.
     const nVerts = this.intrinsicMesh.nVertices;
     this.vertexAngleSums = new Float64Array(nVerts);
-    for (let v = 0; v < nVerts; v++) {
-      this.vertexAngleSums[v] = geom.vertexAngleSum(v);
+    {
+      const nHe = this.intrinsicMesh.nHalfedges;
+      for (let he = 0; he < nHe; he++) {
+        if (this.intrinsicMesh.face(he) === INVALID_INDEX) continue;
+        this.vertexAngleSums[this.intrinsicMesh.vertex(he)]! += geom.cornerAngle(he);
+      }
     }
 
     // Initialise signposts. Direct port of the per-vertex loop in
@@ -298,21 +309,15 @@ export class SignpostIntrinsicTriangulation {
    * passing it through unchanged for boundary vertices.
    *
    * Direct port of `signpost_intrinsic_triangulation.ipp::standardizeAngle`.
-   *
-   * One robustness tweak vs. C++ `std::fmod`: any value within FP epsilon
-   * of the modulus is snapped to 0 to avoid signposts landing at
-   * `vertexAngleSum - ulp` (which is "almost a full revolution" and breaks
-   * monotonicity tests in the iteration sequence). Geometry-central does
-   * not need this because it never compares signpost multisets directly,
-   * but our test suite does.
+   * Uses `angle % modulus` (= `std::fmod` for non-negative angles, which is
+   * always the case here since signpost angles accumulate from 0). Avoids
+   * `modPositive`'s extra `+m` then `%m` which introduces ulp-level rounding
+   * that compounds through the bezier subdivision pipeline.
    */
   private standardizeAngle(v: number, angle: number): number {
     if (this.intrinsicMesh.isBoundaryVertex(v)) return angle;
-    const modulus = this.getCornerAngleSum(v);
-    const m = modPositive(angle, modulus);
-    // Snap values within ~ulp of the modulus to 0.
-    if (modulus - m < 1e-12 * modulus) return 0;
-    return m;
+    // `%` in JS for non-negative operands matches `std::fmod`.
+    return angle % this.getCornerAngleSum(v);
   }
 
   /**

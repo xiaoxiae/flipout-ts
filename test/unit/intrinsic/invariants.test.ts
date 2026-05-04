@@ -154,7 +154,7 @@ describe('invariants — fixture cross-validation (single-edge geodesics only)',
   // the input mesh, the FlipOut path is just that edge — we can verify
   // the trace by tracing along the corresponding intrinsic halfedge for
   // its length and asserting the endpoint lands at dst.
-  for (const name of listFixtures()) {
+  for (const name of listFixtures('geodesic')) {
     const fixture = loadFixture(name);
     const { src, dst } = fixture.query;
     // We only handle the small/predictable ones.

@@ -15,6 +15,7 @@ export {
   FlipEdgeNetwork,
   flipOutPath,
   flipOutPathFromSurfacePoints,
+  flipEdgeNetworkFromControlPath,
   SegmentAngleType,
   SNAP_EPS,
 } from './flip-edge-network.js';

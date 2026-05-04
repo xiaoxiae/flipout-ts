@@ -6,3 +6,4 @@ coverage/
 *.tsbuildinfo
 .venv/
 __pycache__/
+tools/gen_bezier_fixtures/build/

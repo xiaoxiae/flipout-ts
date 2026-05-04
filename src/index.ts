@@ -17,6 +17,7 @@ export {
   FlipEdgeNetwork,
   flipOutPath,
   flipOutPathFromSurfacePoints,
+  flipEdgeNetworkFromControlPath,
   SegmentAngleType,
   SNAP_EPS,
   shortestEdgePath,

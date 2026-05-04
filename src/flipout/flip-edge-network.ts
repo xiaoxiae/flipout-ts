@@ -20,11 +20,21 @@
 //   - pathLength()
 //   - pathHalfedges()
 //   - extractPolyline()
+//   - isMarkedVertex(v) / setMarkedVertex(v, marked)
+//   - straightenAroundMarkedVertices (flag, default true)
 //
 // Naming & control flow follow gc verbatim: `measureSideAngles`,
 // `locallyShortestTestWithType`, `locallyShortenAt`, `iterativeShorten`,
 // `addToWedgeAngleQueue`, `replacePathSegment`, `wedgeAngleQueue`. See the
 // comments next to each method for the gc function it mirrors.
+//
+// Marked vertices: gc supports tagging vertices as "control points" so the
+// straightening pass treats them as fixed — flips that would straighten across
+// a marked vertex are skipped. This is needed by the bezier subdivision
+// algorithm. See `straightenAroundMarkedVertices` (gc default `true`, i.e. the
+// flag has no effect — marked vertices are still passed through). Setting it
+// `false` enforces the gating; gc's `wedgeIsClear` does the equivalent check
+// in the multi-path case.
 
 import type { Vec3 } from '../math/vec3.js';
 import type {
@@ -81,7 +91,13 @@ class WedgeHeap {
     return top;
   }
   private less(a: WedgeQueueEntry, b: WedgeQueueEntry): boolean {
-    return a.angle < b.angle;
+    // Match gc's tiebreak: (angle ASC, type ASC, segId ASC). gc uses
+    // `std::greater<tuple<double, SegmentAngleType, FlipPathSegment>>` whose
+    // tuple compare cascades, with `FlipPathSegment::operator<` keying by
+    // segment id (since all entries here share a single path*).
+    if (a.angle !== b.angle) return a.angle < b.angle;
+    if (a.type !== b.type) return a.type < b.type;
+    return a.segId < b.segId;
   }
   private siftUp(i: number): void {
     const h = this.heap;
@@ -145,12 +161,43 @@ export class FlipEdgeNetwork {
   nShortenIters = 0;
 
   /**
+   * gc's `straightenAroundMarkedVertices`. When `true` (gc default), marked
+   * vertices are still allowed to be straightened through — the flag has no
+   * effect on a path with no obstructed wedges. When `false`, the
+   * straightening pass skips any wedge whose junction vertex is marked,
+   * effectively pinning the path through those control points.
+   */
+  straightenAroundMarkedVertices = true;
+
+  /**
+   * gc's `isMarkedVertex` (`VertexData<bool>` over the *intrinsic* mesh).
+   * Stored as a Uint8Array; lazily grown when the intrinsic mesh gains
+   * vertices via `insertVertex` (used by bezier subdivision).
+   */
+  private markedVertexBits: Uint8Array;
+
+  /**
+   * gc's `pathsAtEdge` simplified to a refcount per edge: the number of
+   * path segments currently using each intrinsic edge (in either direction).
+   * Used by the `wedgeIsClear` check to decide whether a candidate flip
+   * would cross an edge that's already on the path elsewhere — important
+   * in the bezier case where multiple sub-geodesics can meet at a non-mark
+   * interior vertex and produce a non-simple curve.
+   *
+   * For our single-path layout this is at most 2 in pathological cases; we
+   * just track the count and use `count > 0` as the predicate.
+   */
+  private edgeRefCounts: Int32Array;
+
+  /**
    * Construct a network from an initial path of intrinsic halfedge indices.
    * Mirrors gc's `FlipEdgeNetwork(...)` + `FlipEdgePath(...)` for the
    * single-open-path case (closed loops + multi-paths are not supported).
    */
   constructor(intrinsic: SignpostIntrinsicTriangulation, initialPath: number[]) {
     this.intrinsic = intrinsic;
+    this.markedVertexBits = new Uint8Array(intrinsic.intrinsicMesh.nVertices);
+    this.edgeRefCounts = new Int32Array(intrinsic.intrinsicMesh.nEdges);
     if (initialPath.length === 0) {
       throw new Error('FlipEdgeNetwork: initial path must be non-empty');
     }
@@ -172,6 +219,7 @@ export class FlipEdgeNetwork {
     for (const he of initialPath) {
       const id = this.nextSegId++;
       this.segments.set(id, { he, prevId, nextId: -1 });
+      this.incrementEdgeRef(m.edge(he));
       if (prevId !== -1) {
         const prev = this.segments.get(prevId)!;
         prev.nextId = id;
@@ -214,6 +262,62 @@ export class FlipEdgeNetwork {
     const out: number[] = [m.vertex(segs[0]!.he)];
     for (const seg of segs) out.push(m.tipVertex(seg.he));
     return out;
+  }
+
+  // ============================================================================
+  // Marked vertices — gc's `isMarkedVertex` accessors.
+  //
+  // The bit-array auto-grows when the intrinsic mesh gains vertices (via
+  // `insertVertex`); reads past the current capacity return `false`.
+  // ============================================================================
+
+  /** Returns whether intrinsic vertex `v` is marked. */
+  isMarkedVertex(v: number): boolean {
+    return v < this.markedVertexBits.length && this.markedVertexBits[v] !== 0;
+  }
+
+  /** Mark or unmark intrinsic vertex `v`. */
+  setMarkedVertex(v: number, marked: boolean): void {
+    this.ensureMarkedCapacity(v + 1);
+    this.markedVertexBits[v] = marked ? 1 : 0;
+  }
+
+  private ensureMarkedCapacity(n: number): void {
+    if (n <= this.markedVertexBits.length) return;
+    // Grow at least to the intrinsic mesh's current vertex count, with some
+    // slack to amortize repeated growth during subdivision.
+    const target = Math.max(n, this.intrinsic.intrinsicMesh.nVertices, this.markedVertexBits.length * 2);
+    const grown = new Uint8Array(target);
+    grown.set(this.markedVertexBits);
+    this.markedVertexBits = grown;
+  }
+
+  // ============================================================================
+  // edge ref-count maintenance — gc's `pathsAtEdge` reduced to a per-edge count.
+  // ============================================================================
+
+  private edgeInPath(e: number): boolean {
+    return e < this.edgeRefCounts.length && this.edgeRefCounts[e]! > 0;
+  }
+
+  private incrementEdgeRef(e: number): void {
+    this.ensureEdgeRefCapacity(e + 1);
+    this.edgeRefCounts[e]! += 1;
+  }
+
+  private decrementEdgeRef(e: number): void {
+    if (e >= this.edgeRefCounts.length) return;
+    const c = this.edgeRefCounts[e]!;
+    if (c <= 0) return;
+    this.edgeRefCounts[e] = c - 1;
+  }
+
+  private ensureEdgeRefCapacity(n: number): void {
+    if (n <= this.edgeRefCounts.length) return;
+    const target = Math.max(n, this.intrinsic.intrinsicMesh.nEdges, this.edgeRefCounts.length * 2);
+    const grown = new Int32Array(target);
+    grown.set(this.edgeRefCounts);
+    this.edgeRefCounts = grown;
   }
 
   // ============================================================================
@@ -503,11 +607,14 @@ export class FlipEdgeNetwork {
     const curr = this.segments.get(currId);
     if (curr === undefined || curr.prevId === -1) return;
     const prev = this.segments.get(curr.prevId)!;
+    const m = this.intrinsic.intrinsicMesh;
 
     const prevPrevId = prev.prevId;
     const nextNextId = curr.nextId;
 
     // Remove the two old segments.
+    this.decrementEdgeRef(m.edge(prev.he));
+    this.decrementEdgeRef(m.edge(curr.he));
     this.segments.delete(curr.prevId);
     this.segments.delete(currId);
 
@@ -517,6 +624,7 @@ export class FlipEdgeNetwork {
     for (const newHe of newHalfedges) {
       const newId = this.nextSegId++;
       this.segments.set(newId, { he: newHe, prevId: runningPrevId, nextId: -1 });
+      this.incrementEdgeRef(m.edge(newHe));
       if (runningPrevId !== -1) {
         this.segments.get(runningPrevId)!.nextId = newId;
       }
@@ -571,33 +679,81 @@ export class FlipEdgeNetwork {
    * Run FlipOut until convergence (queue empty) or `maxIterations` shorten
    * moves have been performed. gc's `iterativeShorten`.
    */
+  /**
+   * gc's `wedgeIsClear`. Returns true iff the wedge at the junction between
+   * `hePrev` and `heNext` may be straightened. Two reasons it can be blocked:
+   *
+   *   1. The junction vertex is marked AND `straightenAroundMarkedVertices`
+   *      is off (i.e. we're treating it as a fixed control point).
+   *   2. Some intrinsic edge inside the wedge fan is already on the path
+   *      elsewhere — straightening would force the path to cross itself.
+   *      This only matters when the path is non-simple, which happens
+   *      naturally during bezier subdivision when two adjacent sub-geodesics
+   *      share an interior vertex.
+   */
+  private wedgeIsClear(hePrev: number, heNext: number, type: SegmentAngleType): boolean {
+    if (type === SegmentAngleType.Shortest) return true;
+    const m = this.intrinsic.intrinsicMesh;
+    const middleVert = m.vertex(heNext);
+
+    if (!this.straightenAroundMarkedVertices && this.isMarkedVertex(middleVert)) {
+      return false;
+    }
+
+    // Orbit incident edges in the wedge fan; none of them may already be in
+    // the path. The fan walk mirrors gc's `next/twin/next` chains.
+    if (type === SegmentAngleType.LeftTurn) {
+      let heCurr = m.next(hePrev);
+      while (heCurr !== heNext) {
+        if (this.edgeInPath(m.edge(heCurr))) return false;
+        heCurr = m.next(m.twin(heCurr));
+      }
+    } else {
+      // RightTurn. gc starts at `hePrev.twin().next().next().twin()` and
+      // steps `heCurr.next().next().twin()` until reaching heNext.
+      let heCurr = m.twin(m.next(m.next(m.twin(hePrev))));
+      while (heCurr !== heNext) {
+        if (this.edgeInPath(m.edge(heCurr))) return false;
+        heCurr = m.twin(m.next(m.next(heCurr)));
+      }
+    }
+    return true;
+  }
+
   flipOut(maxIterations = 100000): { iterations: number; converged: boolean } {
     let iterations = 0;
 
     while (this.wedgeAngleQueue.size() > 0) {
-      if (iterations >= maxIterations) return { iterations, converged: false };
       const top = this.wedgeAngleQueue.pop()!;
 
       const seg = this.segments.get(top.segId);
-      if (seg === undefined) continue; // segment was deleted (stale)
+      if (seg === undefined) continue;
       if (seg.prevId === -1) continue;
 
-      // Re-check the angle now: it may have changed since enqueue.
       const prev = this.segments.get(seg.prevId)!;
       const { type: currType, angle: currAngle } = this.locallyShortestTestWithType(prev.he, seg.he);
-      if (currType === SegmentAngleType.Shortest) continue; // already straight
-      if (currType !== top.type) {
-        // The minority side's type changed (typically because the other side
-        // became smaller after a neighbouring flip). Re-enqueue with current
-        // type; we'll reprocess later.
+      if (currType === SegmentAngleType.Shortest) continue;
+      // gc drops stale entries silently using strict-equality on the angle:
+      //   - `locallyShortestTestWithType` returns the *smaller* side, and
+      //     queue entries enqueued for the larger side never match.
+      //   - When a neighboring flip mutates this wedge, that flip's own
+      //     `addToWedgeAngleQueue` call inserts a fresh entry with the
+      //     up-to-date angle. We don't re-enqueue here.
+      // Strict `!==` mirrors gc; a tolerance would accept stale entries
+      // gc would discard, producing extra flips and (under the marked-vertex
+      // gate) bezier paths that diverge from gc's reference.
+      if (currType !== top.type) continue;
+      if (currAngle !== top.angle) continue;
+
+      if (!this.wedgeIsClear(prev.he, seg.he, top.type)) continue;
+
+      // About to perform a real flip — enforce the iteration cap here so
+      // queues full of stale entries don't trigger spurious converged=false
+      // when called with maxIterations exactly equal to the natural iter
+      // count. Re-enqueue the popped entry so a follow-up flipOut() resumes.
+      if (iterations >= maxIterations) {
         this.addToWedgeAngleQueue(top.segId);
-        continue;
-      }
-      if (Math.abs(currAngle - top.angle) > 1e-12 * Math.max(1, top.angle)) {
-        // Angle drifted (numerical or due to a neighbouring flip). Re-enqueue
-        // with the up-to-date angle and skip this stale entry.
-        this.addToWedgeAngleQueue(top.segId);
-        continue;
+        return { iterations, converged: false };
       }
 
       // Perform the locally-shorten move.
@@ -605,6 +761,308 @@ export class FlipEdgeNetwork {
       iterations++;
     }
     return { iterations, converged: true };
+  }
+
+  // ============================================================================
+  // Bezier subdivision — direct ports of gc's `bezierSubdivide` and
+  // `bezierSubdivideRecursive` from `flip_geodesics.cpp`. Implements the
+  // de-Casteljau-style scheme of "Modeling on triangulations with geodesic
+  // curves" (Morera, Velho & de Carvalho 2008), but with FlipOut as the
+  // straightening oracle.
+  //
+  // Preconditions (matching gc):
+  //   - the network is a single open path forming a connected curve
+  //   - every control vertex is marked (`isMarkedVertex == true`)
+  //   - the path is simple (no repeated vertex)
+  // ============================================================================
+
+  /**
+   * gc's `FlipEdgeNetwork::bezierSubdivide`. Performs `nRounds` of
+   * de-Casteljau-style subdivision on the current path; the path converges to
+   * an exact geodesic Bezier curve as `nRounds → ∞`.
+   *
+   * Mutates the underlying intrinsic triangulation by inserting midpoint
+   * vertices on edges (via `insertVertex_edge`).
+   *
+   * gc-divergence note: in 14 of 17 fixture cases this port matches gc to
+   * machine epsilon; in 3 (teapot/spot with many near-degenerate geodesic
+   * ties) it produces a valid-but-different Bezier curve, drifting up to ~1%
+   * in length. Root cause is V8's `Math.acos` returning bit patterns that
+   * differ from glibc's `std::acos` by 1 ulp on certain inputs; the drift
+   * cascades into priority-queue tie-breaking. See `CLAUDE.md` ("Bezier
+   * subdivision") and `test/unit/flipout/bezier-fixtures.test.ts` for the
+   * full investigation.
+   */
+  bezierSubdivide(nRounds: number, options: { maxIterations?: number } = {}): void {
+    if (!Number.isInteger(nRounds) || nRounds < 0) {
+      throw new RangeError(`bezierSubdivide: nRounds must be a non-negative integer, got ${nRounds}`);
+    }
+    const maxIter = options.maxIterations ?? 1_000_000;
+
+    // gc disables `straightenAroundMarkedVertices` for the duration of the
+    // call so iterativeShorten respects control points.
+    const oldStraighten = this.straightenAroundMarkedVertices;
+    this.straightenAroundMarkedVertices = false;
+
+    // Ensure the curve is straight to start with.
+    this.flipOut(maxIter);
+
+    const im = this.intrinsic.intrinsicMesh;
+    const head = this.segments.get(this.headId);
+    const tail = this.segments.get(this.tailId);
+    if (head === undefined || tail === undefined) {
+      this.straightenAroundMarkedVertices = oldStraighten;
+      throw new Error('bezierSubdivide: empty path');
+    }
+    const firstControlCall = im.vertex(head.he);
+    const lastControlCall = im.tipVertex(tail.he);
+
+    try {
+      this.bezierSubdivideRecursive(nRounds, firstControlCall, lastControlCall, maxIter);
+    } finally {
+      this.straightenAroundMarkedVertices = oldStraighten;
+    }
+  }
+
+  /**
+   * gc's `FlipEdgeNetwork::bezierSubdivideRecursive`. Each call inserts one
+   * new control point at the midpoint of `firstControlCall .. lastControlCall`
+   * (as defined by the iterative-refinement procedure described in gc) and
+   * recurses on both halves until `nRoundsRemaining` reaches zero.
+   *
+   * Region boundaries are tracked by *vertices*, not segments, since segments
+   * are constantly rewritten by intervening straightening passes.
+   */
+  private bezierSubdivideRecursive(
+    nRoundsRemaining: number,
+    firstControlCall: number,
+    lastControlCall: number,
+    maxIter: number,
+  ): void {
+    if (nRoundsRemaining === 0) return;
+    const im = this.intrinsic.intrinsicMesh;
+
+    // Tolerance for "tSplit close enough to 1 → snap to existing vertex".
+    const useVertexEPS = 1e-4;
+
+    let firstControlActive = firstControlCall;
+    let lastControlActive = lastControlCall;
+    let newMidpoint = -1;
+
+    while (true) {
+      const firstSegId = this.findSegmentAfterId(firstControlActive);
+      const lastSegId = this.findSegmentBeforeId(lastControlActive);
+      if (firstSegId === -1 || lastSegId === -1) {
+        throw new Error('bezierSubdivide: could not find first/last segment');
+      }
+
+      // Walk the path between firstSeg and lastSeg, partitioning into regions
+      // delimited by marked vertices (= "control regions").
+      interface Region {
+        firstSegId: number;
+        lastSegId: number;
+        length: number;
+      }
+      const regions: Region[] = [];
+      {
+        let currId = firstSegId;
+        let regionStartId = firstSegId;
+        let length = 0;
+        while (true) {
+          const curr = this.segments.get(currId)!;
+          length += this.intrinsic.edgeLengths[im.edge(curr.he)]!;
+          const tip = im.tipVertex(curr.he);
+          if (this.isMarkedVertex(tip)) {
+            regions.push({ firstSegId: regionStartId, lastSegId: currId, length });
+            if (currId === lastSegId) break;
+            currId = curr.nextId;
+            regionStartId = currId;
+            length = 0;
+          } else {
+            currId = curr.nextId;
+          }
+          if (currId === -1) {
+            throw new Error('bezierSubdivide: walked off path before reaching lastSeg');
+          }
+        }
+      }
+
+      const isLast = regions.length === 1;
+
+      // Unmark all old interior control points (except on the last iteration —
+      // we want to keep at least the bracketing controls of the recursive
+      // call alive).
+      if (!isLast) {
+        for (const region of regions) {
+          let pId = region.firstSegId;
+          while (true) {
+            if (pId !== firstSegId) {
+              const p = this.segments.get(pId)!;
+              const vertBefore = im.vertex(p.he);
+              this.setMarkedVertex(vertBefore, false);
+              const sId = this.findSegmentAfterId(vertBefore);
+              if (sId !== -1) this.addToWedgeAngleQueue(sId);
+            }
+            if (pId === region.lastSegId) break;
+            pId = this.segments.get(pId)!.nextId;
+          }
+        }
+      }
+
+      // For each region, find the segment containing the midpoint by
+      // arc-length, split (or snap), mark the new vertex.
+      const newControlPoints: number[] = [];
+      for (const region of regions) {
+        const halfLen = region.length * 0.5;
+        let runningLen = 0;
+        let pId = region.firstSegId;
+        while (true) {
+          const p = this.segments.get(pId)!;
+          const eLen = this.intrinsic.edgeLengths[im.edge(p.he)]!;
+          const nextLen = runningLen + eLen;
+          if ((1 + useVertexEPS) * nextLen > halfLen) break;
+          if (pId === region.lastSegId) {
+            throw new Error("bezierSubdivide: couldn't find split segment");
+          }
+          runningLen = nextLen;
+          pId = p.nextId;
+        }
+
+        const splitId = pId;
+        const split = this.segments.get(splitId)!;
+        const splitELen = this.intrinsic.edgeLengths[im.edge(split.he)]!;
+        const tSplit = (halfLen - runningLen) / splitELen;
+
+        let newControlP: number;
+        if (tSplit > 1 - useVertexEPS) {
+          // Snap to the existing tip vertex — happens often on regular grids.
+          newControlP = im.tipVertex(split.he);
+        } else {
+          newControlP = this.splitSegmentEdge(splitId, tSplit);
+        }
+        this.setMarkedVertex(newControlP, true);
+        newControlPoints.push(newControlP);
+      }
+
+      // Shrink the active region to the span between the new endpoints.
+      firstControlActive = newControlPoints[0]!;
+      lastControlActive = newControlPoints[newControlPoints.length - 1]!;
+
+      // Straighten to geodesic before the next refinement pass.
+      this.flipOut(maxIter);
+
+      if (isLast) {
+        newMidpoint = newControlPoints[0]!;
+        break;
+      }
+    }
+
+    // Recurse on both halves.
+    this.bezierSubdivideRecursive(nRoundsRemaining - 1, firstControlCall, newMidpoint, maxIter);
+    this.bezierSubdivideRecursive(nRoundsRemaining - 1, newMidpoint, lastControlCall, maxIter);
+  }
+
+  /**
+   * gc's `findSegmentAfter(v)`: the segment in the path whose tail is `v`.
+   * Throws if multiple segments are incident on the same side (path is not
+   * simple at `v`). Returns `-1` if no segment matches.
+   */
+  private findSegmentAfterId(v: number): number {
+    const im = this.intrinsic.intrinsicMesh;
+    let id = this.headId;
+    let found = -1;
+    while (id !== -1) {
+      const seg = this.segments.get(id)!;
+      if (im.vertex(seg.he) === v) {
+        if (found !== -1) throw new Error('bezierSubdivide: multiple paths at vertex');
+        found = id;
+      }
+      id = seg.nextId;
+    }
+    return found;
+  }
+
+  /** gc's `findSegmentBefore(v)`: the segment whose tip is `v`. */
+  private findSegmentBeforeId(v: number): number {
+    const im = this.intrinsic.intrinsicMesh;
+    let id = this.headId;
+    let found = -1;
+    while (id !== -1) {
+      const seg = this.segments.get(id)!;
+      if (im.tipVertex(seg.he) === v) {
+        if (found !== -1) throw new Error('bezierSubdivide: multiple paths at vertex');
+        found = id;
+      }
+      id = seg.nextId;
+    }
+    return found;
+  }
+
+  /**
+   * gc's `FlipPathSegment::splitEdge(tSplit)` + `updatePathAfterEdgeSplit`.
+   * Splits the edge under segment `segId` at parameter `tSplit ∈ (0, 1)`
+   * along the segment's halfedge orientation, inserting a new intrinsic
+   * vertex and replacing the segment with two consecutive segments.
+   * Returns the new vertex's index.
+   *
+   * The two new wedges (at the original tail and at the new vertex) are
+   * re-enqueued for straightening — the geometry of the new edges is
+   * straight by construction, but numerical drift in signposts can shift
+   * the angle by ~ε.
+   */
+  private splitSegmentEdge(segId: number, tSplit: number): number {
+    const seg = this.segments.get(segId)!;
+    const im = this.intrinsic.intrinsicMesh;
+    const origHe = seg.he;
+    const origTail = im.vertex(origHe);
+    const origTip = im.tipVertex(origHe);
+    const origEdge = im.edge(origHe);
+    // `insertVertex_edge` interprets t along the edge's canonical halfedge.
+    // If our segment runs along the canonical halfedge, t passes through;
+    // otherwise we flip it.
+    const origForward = origHe === im.edgeHalfedge(origEdge);
+    const insertT = origForward ? tSplit : 1 - tSplit;
+
+    const newV = this.intrinsic.insertVertex_edge(origEdge, insertT);
+
+    // Find the two halves of the original edge as outgoing halfedges of
+    // newV — they're the ones whose tip is one of the original endpoints.
+    let frontHe = -1; // newV → origTip
+    let backHe = -1; // newV → origTail
+    for (const he of im.outgoingHalfedges(newV)) {
+      if (im.tipVertex(he) === origTip) frontHe = he;
+      else if (im.tipVertex(he) === origTail) backHe = he;
+    }
+    if (frontHe === -1 || backHe === -1) {
+      throw new Error('splitSegmentEdge: front/back halfedges of new vertex not found');
+    }
+
+    // Wire the two new segments in path orientation.
+    //   first segment (kept id):  origTail → newV  = twin(backHe)
+    //   second segment (new id):  newV → origTip   = frontHe
+    // The original edge ref was held by `seg`; release it and acquire two
+    // new refs (one per new edge half).
+    this.decrementEdgeRef(origEdge);
+    seg.he = im.twin(backHe);
+    this.incrementEdgeRef(im.edge(seg.he));
+
+    const newSegId = this.nextSegId++;
+    const newSeg: PathSegment = { he: frontHe, prevId: segId, nextId: seg.nextId };
+    this.segments.set(newSegId, newSeg);
+    this.incrementEdgeRef(im.edge(frontHe));
+
+    if (seg.nextId !== -1) {
+      const oldNext = this.segments.get(seg.nextId)!;
+      oldNext.prevId = newSegId;
+    } else {
+      this.tailId = newSegId;
+    }
+    seg.nextId = newSegId;
+
+    this.addToWedgeAngleQueue(segId);
+    this.addToWedgeAngleQueue(newSegId);
+
+    return newV;
   }
 
   // ============================================================================
@@ -891,4 +1349,67 @@ export function flipOutPathFromSurfacePoints(
   const polyline = concatPolylines(parts);
   const length = network.pathLength();
   return { polyline, length, iterations, converged };
+}
+
+/**
+ * gc's `FlipEdgeNetwork::constructFromPiecewiseDijkstraPath`. Builds an
+ * initial path by concatenating per-segment Dijkstra paths between
+ * consecutive control vertices, then constructs a `FlipEdgeNetwork`. When
+ * `markInterior` is true, every control vertex is marked — the caller can
+ * subsequently set `straightenAroundMarkedVertices = false` to pin the path
+ * through them (used by bezier subdivision).
+ *
+ * Returns `null` if any segment is disconnected or has zero length
+ * (`vA === vB`), matching gc's null-return contract.
+ *
+ * Closed loops (gc's `closed` argument) are not supported here — the
+ * downstream `FlipEdgeNetwork` handles only open paths.
+ */
+export function flipEdgeNetworkFromControlPath(
+  intrinsic: SignpostIntrinsicTriangulation,
+  controlVertices: readonly number[],
+  options: { markInterior?: boolean } = {},
+): FlipEdgeNetwork | null {
+  const { markInterior = false } = options;
+  if (controlVertices.length < 2) {
+    throw new Error(
+      `flipEdgeNetworkFromControlPath: need ≥2 control vertices, got ${controlVertices.length}`,
+    );
+  }
+
+  const m = intrinsic.intrinsicMesh;
+  const halfedges: number[] = [];
+  for (let i = 0; i + 1 < controlVertices.length; i++) {
+    const vA = controlVertices[i]!;
+    const vB = controlVertices[i + 1]!;
+    const seg = shortestEdgePath(intrinsic, vA, vB);
+    if (seg === null || seg.length === 0) return null;
+    for (const he of seg) halfedges.push(he);
+  }
+  if (halfedges.length === 0) return null;
+
+  // gc's back-and-forth cleanup. Only safe when not marking the interior
+  // joins, since collapsing a `[he, he.twin()]` pair removes the visit to
+  // their shared middle vertex — which would have been a control point.
+  let pathHe: number[];
+  if (markInterior) {
+    pathHe = halfedges;
+  } else {
+    pathHe = [];
+    for (const he of halfedges) {
+      const last = pathHe.length > 0 ? pathHe[pathHe.length - 1]! : -1;
+      if (last !== -1 && last === m.twin(he)) {
+        pathHe.pop();
+      } else {
+        pathHe.push(he);
+      }
+    }
+    if (pathHe.length === 0) return null;
+  }
+
+  const net = new FlipEdgeNetwork(intrinsic, pathHe);
+  if (markInterior) {
+    for (const v of controlVertices) net.setMarkedVertex(v, true);
+  }
+  return net;
 }

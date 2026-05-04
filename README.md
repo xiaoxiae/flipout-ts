@@ -54,6 +54,38 @@ vertices), use `flipOutPathFromSurfacePoints` from `flipout-ts/flipout`. The
 intrinsic triangulation is mutated in-place by the algorithm; rebuild it for
 each independent query.
 
+## Bezier curves on a surface
+
+`bezierSubdivide` builds a geodesic Bezier curve through control vertices via
+the de-Casteljau-style scheme of Morera, Velho & de Carvalho 2008, using
+FlipOut as the straightening oracle. Pair it with `flipEdgeNetworkFromControlPath`
+to set up the network from a control-vertex list:
+
+```ts
+import {
+  SurfaceMesh, VertexPositionGeometry, SignpostIntrinsicTriangulation,
+  flipEdgeNetworkFromControlPath,
+} from 'flipout-ts';
+
+const sit = new SignpostIntrinsicTriangulation(
+  new VertexPositionGeometry(mesh, positions),
+);
+const net = flipEdgeNetworkFromControlPath(sit, [c0, c1, c2, c3], {
+  markInterior: true,
+});
+net!.bezierSubdivide(3);             // 3 rounds of subdivision
+console.log(net!.pathLength());      // intrinsic length of the Bezier curve
+console.log(net!.pathHalfedges());   // intrinsic halfedge sequence
+```
+
+**Cross-runtime caveat:** the underlying priority queue is sensitive to
+1-ulp differences between V8's `Math.acos` and glibc's `std::acos`. On
+near-degenerate geometries (the canonical Newell teapot is one) the same
+input may produce a path whose length differs from geometry-central's
+reference by up to ~1%. The output is still a valid geodesic Bezier curve.
+This is a fundamental V8/glibc divergence; see `CLAUDE.md` for the full
+investigation.
+
 ## Port conventions
 
 - **One source file per geometry-central translation unit.** A header banner
