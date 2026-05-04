@@ -1139,9 +1139,49 @@ export class SignpostIntrinsicTriangulation {
    * just the endpoint. Added here (rather than at L4) so the 2D-layout
    * machinery and tolerance constants stay encapsulated.
    */
-  tracePolylineFromVertex(v: number, tangentAngle: number, distance: number): Vec3[] {
+  /**
+   * Single-shot trace from a `SurfacePoint` start: walk `dist` along the
+   * input mesh in tangent direction `tangentAngle` and return only the
+   * destination as a {@link TraceResult}. Used by chained polyline
+   * extraction (e.g. `extractPolyline` over bezier-subdivided paths) to
+   * obtain the SurfacePoint at each segment's terminus without paying for
+   * a full polyline allocation.
+   */
+  traceFromSurfacePoint(
+    start: SurfacePoint,
+    tangentAngle: number,
+    distance: number,
+  ): TraceResult {
+    if (start.kind === 'vertex') {
+      return this.traceFromVertex(start.vertex, tangentAngle, distance);
+    }
+    const finalState = { face: -1, bary: [0, 0, 0] as Vec3 };
+    const poly = this.tracePolylineFromSurfacePoint(start, tangentAngle, distance, finalState);
+    return {
+      position: poly[poly.length - 1] ?? this.surfacePointPosition(start),
+      faceIndex: finalState.face,
+      barycentric: finalState.bary,
+    };
+  }
+
+  tracePolylineFromVertex(
+    v: number,
+    tangentAngle: number,
+    distance: number,
+    finalState?: { face: number; bary: Vec3 },
+  ): Vec3[] {
     const startPos = this.inputGeometry.position(v);
-    if (distance === 0) return [startPos];
+    if (distance === 0) {
+      if (finalState) {
+        // Distance-0 trace stays at the start vertex; pick any incident face.
+        const m = this.inputGeometry.mesh;
+        const he = m.vertexHalfedge(v);
+        finalState.face = m.face(he);
+        // Vertex sits at the corner of `he` (= h0) → bary (1, 0, 0).
+        finalState.bary = [1, 0, 0];
+      }
+      return [startPos];
+    }
 
     const m = this.inputGeometry.mesh;
     const angle2pi = modPositive(tangentAngle, 2 * Math.PI);
@@ -1190,7 +1230,7 @@ export class SignpostIntrinsicTriangulation {
     }
 
     const relRaw = (angle2pi - chosenStartAngle) / scale;
-    return this.tracePolylineInFaceFromVertexCorner(chosenHe, relRaw, distance);
+    return this.tracePolylineInFaceFromVertexCorner(chosenHe, relRaw, distance, finalState);
   }
 
   /**
@@ -1235,12 +1275,32 @@ export class SignpostIntrinsicTriangulation {
     start: SurfacePoint,
     tangentAngle: number,
     dist: number,
+    finalState?: { face: number; bary: Vec3 },
   ): Vec3[] {
     const startPos = this.surfacePointPosition(start);
-    if (dist === 0) return [startPos];
+    if (dist === 0) {
+      if (finalState) {
+        // Place the start as a face-relative bary so callers can chain.
+        const m = this.inputGeometry.mesh;
+        if (start.kind === 'vertex') {
+          const he = m.vertexHalfedge(start.vertex);
+          finalState.face = m.face(he);
+          finalState.bary = [1, 0, 0];
+        } else if (start.kind === 'edge') {
+          const heE = m.edgeHalfedge(start.edge);
+          const f = m.face(heE);
+          finalState.face = f >= 0 ? f : m.face(m.twin(heE));
+          finalState.bary = [1 - start.t, start.t, 0];
+        } else {
+          finalState.face = start.face;
+          finalState.bary = [start.bary[0], start.bary[1], start.bary[2]];
+        }
+      }
+      return [startPos];
+    }
 
     if (start.kind === 'vertex') {
-      return this.tracePolylineFromVertex(start.vertex, tangentAngle, dist);
+      return this.tracePolylineFromVertex(start.vertex, tangentAngle, dist, finalState);
     }
 
     const m = this.inputGeometry.mesh;
@@ -1403,6 +1463,7 @@ export class SignpostIntrinsicTriangulation {
       dir,
       dist,
       startPos,
+      finalState,
     );
   }
 
@@ -1674,6 +1735,7 @@ export class SignpostIntrinsicTriangulation {
     startHe: number,
     relAngleRaw: number,
     distance: number,
+    finalState?: { face: number; bary: Vec3 },
   ): Vec3[] {
     const m = this.inputGeometry.mesh;
 
@@ -1707,6 +1769,7 @@ export class SignpostIntrinsicTriangulation {
       dir,
       distance,
       startVertex3D,
+      finalState,
     );
   }
 
@@ -1733,6 +1796,13 @@ export class SignpostIntrinsicTriangulation {
     initDir: Vec2,
     distance: number,
     initialOutPoint: Vec3,
+    /**
+     * Optional out-param. If provided, populated with the (input-mesh) face
+     * containing the trace's final point and its barycentric coordinates in
+     * `(corner of heA's tail, corner of heB's tail, corner of heC's tail)`
+     * order — same convention as {@link TraceResult.barycentric}.
+     */
+    finalState?: { face: number; bary: Vec3 },
   ): Vec3[] {
     const m = this.inputGeometry.mesh;
 
@@ -1808,6 +1878,10 @@ export class SignpostIntrinsicTriangulation {
         const pEnd: Vec2 = [endX, endY];
         const bary = this.baryInLayoutTriangle(pEnd, pA, pB, pC);
         out.push(this.lift3DFromVertices(vA, vB, vC, bary));
+        if (finalState) {
+          finalState.face = face;
+          finalState.bary = bary;
+        }
         return out;
       }
 
@@ -1821,6 +1895,10 @@ export class SignpostIntrinsicTriangulation {
       const twin = m.twin(crossHe);
       if (m.face(twin) === INVALID_INDEX) {
         // Hit the boundary — terminate at the crossing point we just appended.
+        if (finalState) {
+          finalState.face = face;
+          finalState.bary = baryCross;
+        }
         return out;
       }
 
@@ -1870,12 +1948,13 @@ export class SignpostIntrinsicTriangulation {
       remaining = newRemaining;
     }
 
-    // Iter cap: append best-effort endpoint. `face` tracks the current input
-    // face index for parity with `traceInFaceFromVertexCorner`; not part of
-    // the polyline output.
-    void face;
+    // Iter cap: append best-effort endpoint.
     const bary = this.baryInLayoutTriangle(p, pA, pB, pC);
     out.push(this.lift3DFromVertices(vA, vB, vC, bary));
+    if (finalState) {
+      finalState.face = face;
+      finalState.bary = bary;
+    }
     return out;
   }
 

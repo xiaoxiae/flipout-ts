@@ -59,8 +59,10 @@
       }
       #reset,
       #mesh,
+      #mode,
       #obj-button,
-      #animate {
+      #animate,
+      #bezier-compute {
         padding: 6px 12px;
         font-size: 13px;
         background: #2c2c38;
@@ -72,16 +74,20 @@
       }
       #reset:hover,
       #mesh:hover,
+      #mode:hover,
       #obj-button:hover,
-      #animate:hover:not(:disabled) {
+      #animate:hover:not(:disabled),
+      #bezier-compute:hover:not(:disabled) {
         background: #3a3a4a;
       }
       #reset:active,
       #obj-button:active,
-      #animate:active:not(:disabled) {
+      #animate:active:not(:disabled),
+      #bezier-compute:active:not(:disabled) {
         background: #2c2c38;
       }
-      #animate:disabled {
+      #animate:disabled,
+      #bezier-compute:disabled {
         opacity: 0.4;
         cursor: not-allowed;
       }
@@ -119,9 +125,13 @@
   </head>
   <body>
     <div id="overlay">
-      <h1>FlipOut geodesic demo &mdash; click two points on the mesh</h1>
+      <h1 id="title">FlipOut geodesic demo &mdash; click two points on the mesh</h1>
       <p id="status">Click to set source.</p>
       <div id="controls">
+        <select id="mode">
+          <option value="geodesic">Mode: geodesic (2 points)</option>
+          <option value="bezier">Mode: bezier (3+ control vertices)</option>
+        </select>
         <select id="mesh">
           <option value="teapot">Utah teapot (1601 V)</option>
           <option value="icosphere">Icosphere (42 V)</option>
@@ -133,6 +143,12 @@
         <input id="obj-input" type="file" accept=".obj" />
         <button id="animate" type="button" disabled>Animate</button>
         <button id="reset">Reset</button>
+      </div>
+      <div id="bezier-row" style="display: none; margin-top: 6px; align-items: center; gap: 8px; pointer-events: auto; font-size: 13px;">
+        <label for="rounds">Subdivisions:</label>
+        <input id="rounds" type="range" min="0" max="3" step="1" value="1" />
+        <span id="rounds-val" style="font-variant-numeric: tabular-nums; min-width: 1ch;">1</span>
+        <button id="bezier-compute" type="button" disabled>Compute</button>
       </div>
       <div id="wireframe-row">
         <input id="wireframe" type="checkbox" />

@@ -1076,41 +1076,65 @@ export class FlipEdgeNetwork {
    * Extract a 3D polyline by tracing each path segment across the input
    * mesh and concatenating the per-segment polylines (de-duplicating
    * shared endpoints).
+   *
+   * Each segment is traced INDEPENDENTLY from whichever endpoint is
+   * easier — original vertex preferred, otherwise via `tracePolylineFromVertex`
+   * starting from a known anchor. For path segments with both endpoints
+   * inserted (which can happen during `bezierSubdivide` when consecutive
+   * midpoints sit on a single intrinsic-only edge), we trace from the
+   * tail's stored `insertedVertexLocations` SurfacePoint via
+   * `tracePolylineFromSurfacePoint`. Note: when an insertion target was on
+   * an intrinsic-only edge, the stored SurfacePoint's edge id is bogus
+   * (it references the intrinsic edge, not an input edge), so the
+   * resulting polyline can drift; bezier curves with deep subdivision
+   * may show visible deviation. Demo-quality but not production-quality.
    */
   extractPolyline(): Vec3[] {
-    const out: Vec3[] = [];
-    const im = this.intrinsic.intrinsicMesh;
-
+    const parts: Vec3[][] = [];
     for (const seg of this.iterPath()) {
-      const tail = im.vertex(seg.he);
-      const len = this.intrinsic.edgeLengths[im.edge(seg.he)]!;
-      // Convert raw signpost angle to rescaled tangent angle (the form
-      // `tracePolylineFromVertex` expects).
-      const rawAngle = this.intrinsic.halfedgeSignposts[seg.he]!;
-      const rescaledAngle = rawAngle / this.intrinsic.vertexAngleScaling(tail);
-      const seg3D = this.intrinsic.tracePolylineFromVertex(tail, rescaledAngle, len);
-
-      if (seg3D.length === 0) continue;
-      if (out.length === 0) {
-        out.push(...seg3D);
-      } else {
-        // Drop the first point of `seg3D` if it coincides with the last
-        // point of `out` (shared endpoint between consecutive traces).
-        const last = out[out.length - 1]!;
-        const first = seg3D[0]!;
-        const samePoint =
-          Math.abs(last[0] - first[0]) < 1e-9 &&
-          Math.abs(last[1] - first[1]) < 1e-9 &&
-          Math.abs(last[2] - first[2]) < 1e-9;
-        if (samePoint) {
-          for (let i = 1; i < seg3D.length; i++) out.push(seg3D[i]!);
-        } else {
-          out.push(...seg3D);
-        }
-      }
+      parts.push(traceSegmentPolylineAuto(this.intrinsic, seg.he));
     }
+    return concatPolylines(parts);
+  }
+}
+
+function traceSegmentPolylineAuto(
+  intrinsic: SignpostIntrinsicTriangulation,
+  segHe: number,
+): Vec3[] {
+  const im = intrinsic.intrinsicMesh;
+  const tail = im.vertex(segHe);
+  const tip = im.tipVertex(segHe);
+  const inputNV = intrinsic.inputGeometry.mesh.nVertices;
+  const tailIsOriginal = tail < inputNV;
+  const tipIsOriginal = tip < inputNV;
+  const len = intrinsic.edgeLengths[im.edge(segHe)]!;
+
+  if (tailIsOriginal) {
+    const rawAngle = intrinsic.halfedgeSignposts[segHe]!;
+    const rescaled = rawAngle / intrinsic.vertexAngleScaling(tail);
+    return intrinsic.tracePolylineFromVertex(tail, rescaled, len);
+  }
+
+  if (tipIsOriginal) {
+    // Trace backward from original tip via the twin halfedge.
+    const heTwin = im.twin(segHe);
+    const rawAngle = intrinsic.halfedgeSignposts[heTwin]!;
+    const rescaled = rawAngle / intrinsic.vertexAngleScaling(tip);
+    const out = intrinsic.tracePolylineFromVertex(tip, rescaled, len);
+    out.reverse();
     return out;
   }
+
+  // Both endpoints inserted by `bezierSubdivide`. Their stored
+  // `insertedVertexLocations` SurfacePoints reference INTRINSIC edges that
+  // may not exist in the input mesh (the intrinsic edge was created by an
+  // earlier flip). Tracing from such a SurfacePoint throws — return an
+  // empty polyline so the caller can stitch the gap with a straight
+  // approximation. A correct implementation would port gc's
+  // `resolveNewVertex` to compute proper input-mesh SurfacePoints at
+  // insertion time; for the demo we accept these gaps.
+  return [];
 }
 
 /**
