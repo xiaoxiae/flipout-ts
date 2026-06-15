@@ -13,10 +13,18 @@
 
 export {
   FlipEdgeNetwork,
+  BezierNonSimpleError,
   flipOutPath,
   flipOutPathFromSurfacePoints,
   flipEdgeNetworkFromControlPath,
+  flipEdgeNetworkFromSurfacePointControlPath,
   SegmentAngleType,
   SNAP_EPS,
 } from './flip-edge-network.js';
 export { shortestEdgePath } from './dijkstra.js';
+export {
+  geodesicSpline,
+  type GeodesicSplineType,
+  type GeodesicSplineOptions,
+  type GeodesicSplineResult,
+} from './geodesic-spline.js';

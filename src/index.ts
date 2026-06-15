@@ -15,10 +15,18 @@ export { SignpostIntrinsicTriangulation, layoutTriangleVertex } from './intrinsi
 export type { TraceResult, SurfacePoint } from './intrinsic/index.js';
 export {
   FlipEdgeNetwork,
+  BezierNonSimpleError,
   flipOutPath,
   flipOutPathFromSurfacePoints,
   flipEdgeNetworkFromControlPath,
+  flipEdgeNetworkFromSurfacePointControlPath,
+  geodesicSpline,
   SegmentAngleType,
   SNAP_EPS,
   shortestEdgePath,
+} from './flipout/index.js';
+export type {
+  GeodesicSplineType,
+  GeodesicSplineOptions,
+  GeodesicSplineResult,
 } from './flipout/index.js';

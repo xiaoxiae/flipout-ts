@@ -33,7 +33,11 @@
 import { type Vec2, fromAngle, modPositive } from '../math/vec2.js';
 import * as Vec2Ops from '../math/vec2.js';
 import type { Vec3 } from '../math/vec3.js';
-import { cornerAngleFromLengths, triangleAreaFromLengths } from '../math/triangle.js';
+import {
+  cartesianToBarycentric,
+  cornerAngleFromLengths,
+  triangleAreaFromLengths,
+} from '../math/triangle.js';
 import { INVALID_INDEX, SurfaceMesh, type Triangle } from '../mesh/surface-mesh.js';
 import type { VertexPositionGeometry } from '../geometry/vertex-position-geometry.js';
 
@@ -164,6 +168,24 @@ export class SignpostIntrinsicTriangulation {
    * an inserted vertex. Original input vertices are NOT in this map.
    */
   readonly insertedVertexLocations = new Map<number, SurfacePoint>();
+
+  /**
+   * For each inserted vertex, the angle offset `δ` that converts an outgoing
+   * halfedge's rescaled signpost angle into the `tangentAngle` expected by
+   * {@link tracePolylineFromSurfacePoint} at that vertex's stored input
+   * location:
+   *
+   *   tangentAngle(he) = halfedgeSignposts[he] / vertexAngleScaling(v) + δ
+   *
+   * `δ` is fixed by {@link resolveNewVertex} at insertion time: it folds in
+   * both the input-face layout offset of the stored location and the rotation
+   * between the intrinsic signpost frame (anchored to intrinsic geometry) and
+   * the input-face frame (anchored to the location's containing input face).
+   * Needed because after edge flips the intrinsic frame is no longer aligned
+   * with the input mesh, so the rescaled signpost alone is not a valid input
+   * trace direction. See {@link insertedTraceAngle}.
+   */
+  private readonly insertedVertexAngleOffsets = new Map<number, number>();
 
   // --------------------------------------------------------------------------
   // Construction.
@@ -653,9 +675,8 @@ export class SignpostIntrinsicTriangulation {
       }
     }
 
-    // Store the new vertex's location on the input mesh.
-    const inputLoc = this.locateInsertedVertex_face(f, [b0, b1, b2]);
-    this.insertedVertexLocations.set(newVertex, inputLoc);
+    // Store the new vertex's location on the input mesh (+ trace frame).
+    this.resolveNewVertex(newVertex, newHalfedgesFromNew);
 
     return newVertex;
   }
@@ -807,9 +828,8 @@ export class SignpostIntrinsicTriangulation {
       }
     }
 
-    // Store the new vertex's location on the input mesh.
-    const inputLoc = this.locateInsertedVertex_edge(e, t);
-    this.insertedVertexLocations.set(newVertex, inputLoc);
+    // Store the new vertex's location on the input mesh (+ trace frame).
+    this.resolveNewVertex(newVertex, newHalfedgesFromNew);
 
     return newVertex;
   }
@@ -855,66 +875,220 @@ export class SignpostIntrinsicTriangulation {
   }
 
   /**
-   * Compute a `SurfacePoint` on the input mesh for a face-interior
-   * insertion. Currently only handles insertion into a face that is still
-   * an *original* input-mesh face. (Inserting into a face produced by a
-   * previous insertion or a flip would require recursive resolution; we
-   * skip that until needed.)
+   * Resolve a freshly-inserted intrinsic vertex to a location on the *input*
+   * mesh and record the trace frame needed to walk geodesics out of it.
+   * Ports gc's `SignpostIntrinsicTriangulation::resolveNewVertex`.
+   *
+   * The earlier index-aliasing approach (assume intrinsic face/edge index ==
+   * input index) only held before any edge flips; after the flips performed
+   * during FlipOut / bezier subdivision an intrinsic edge no longer
+   * corresponds to the same-id input edge, so inserted vertices were stored
+   * at garbage input locations and the extracted polyline left the surface.
+   *
+   * Instead — exactly like gc — we trace a geodesic along the *input* mesh
+   * from an already-resolved neighbour `w` (preferring original input
+   * vertices, then by shortest connecting edge) in the direction of the
+   * intrinsic halfedge `w → newV`, for that edge's intrinsic length. Where
+   * the trace lands is `newV`'s input-mesh `SurfacePoint`. The trace's
+   * arrival direction (in the landing input face's 2D frame) ties the
+   * intrinsic signpost frame at `newV` to the input frame, giving the angle
+   * offset `δ` stored in {@link insertedVertexAngleOffsets}.
+   *
+   * @param newVertex - the just-created intrinsic vertex
+   * @param newHalfedgesFromNew - outgoing halfedges from `newVertex` (CCW)
    */
-  private locateInsertedVertex_face(
-    f: number,
-    bary: [number, number, number],
-  ): SurfacePoint {
-    const inputMesh = this.inputGeometry.mesh;
-    if (f < inputMesh.nFaces) {
-      // The intrinsic-face index `f` aligns with an input-face index because
-      // we haven't done any flips that re-index faces (flipEdge preserves
-      // face indices). Verify the corner vertex set matches before accepting.
-      const im = this.intrinsicMesh;
-      const vsIm = [...im.verticesOfFace(f)];
-      const vsIn = [...inputMesh.verticesOfFace(f)];
-      if (
-        vsIm.length === 3 &&
-        vsIn.length === 3 &&
-        vsIm[0] === vsIn[0] &&
-        vsIm[1] === vsIn[1] &&
-        vsIm[2] === vsIn[2]
-      ) {
-        return { kind: 'face', face: f, bary };
+  private resolveNewVertex(
+    newVertex: number,
+    newHalfedgesFromNew: number[],
+  ): void {
+    const im = this.intrinsicMesh;
+    const inputNV = this.inputGeometry.mesh.nVertices;
+
+    const hasLocation = (v: number): boolean =>
+      v < inputNV || this.insertedVertexLocations.has(v);
+
+    // Pick the best outgoing halfedge `newV → w` to trace back along (we
+    // trace from `w` toward `newV`). Prefer fully-interior edges to a
+    // resolved neighbour; among those, original neighbours, then shortest.
+    let bestHe = -1;
+    let bestKey: [number, number] | null = null; // [originalRank, length]
+    const consider = (requireInterior: boolean): void => {
+      for (const heOut of newHalfedgesFromNew) {
+        if (im.face(heOut) === INVALID_INDEX) continue; // boundary outgoing
+        if (requireInterior && im.face(im.twin(heOut)) === INVALID_INDEX) continue;
+        const w = im.tipVertex(heOut);
+        if (!hasLocation(w)) continue;
+        const originalRank = w < inputNV ? 0 : 1;
+        const len = this.edgeLengths[im.edge(heOut)]!;
+        if (
+          bestKey === null ||
+          originalRank < bestKey[0] ||
+          (originalRank === bestKey[0] && len < bestKey[1])
+        ) {
+          bestKey = [originalRank, len];
+          bestHe = heOut;
+        }
       }
+    };
+    consider(true);
+    if (bestHe < 0) consider(false);
+    if (bestHe < 0) {
+      throw new Error(
+        `resolveNewVertex: no resolvable neighbour for vertex ${newVertex}`,
+      );
     }
-    // Fallback: no clean correspondence — store as face anyway so traces
-    // can at least try; we throw if the trace later finds it inconsistent.
-    return { kind: 'face', face: f, bary };
+
+    const heN2W = bestHe; // newV → w
+    const w = im.tipVertex(heN2W);
+    const heW2N = im.twin(heN2W); // w → newV
+    const dist = this.edgeLengths[im.edge(heN2W)]!;
+
+    // Trace from `w` toward `newV` along the input mesh. We only trust
+    // `finalState.face` (frame-independent) and the 3D polyline; the
+    // `dir`/`bary` frame depends on how the trace's start face was laid out
+    // (vertex-corner starts anchor +x at the start halfedge, not
+    // `faceHalfedge`), so we re-derive both quantities canonically below.
+    const finalState = { face: -1, bary: [0, 0, 0] as Vec3 };
+    let poly: Vec3[];
+    if (w < inputNV) {
+      const angle =
+        this.halfedgeSignposts[heW2N]! / this.vertexAngleScaling(w);
+      poly = this.tracePolylineFromVertex(w, angle, dist, finalState);
+    } else {
+      const angle = this.insertedTraceAngle(heW2N);
+      const locW = this.insertedVertexLocations.get(w)!;
+      poly = this.tracePolylineFromSurfacePoint(locW, angle, dist, finalState);
+    }
+
+    if (finalState.face < 0 || poly.length < 2) {
+      // Degenerate trace (zero distance / immediate vertex hit). Fall back to
+      // pinning the position via the neighbour; offset is irrelevant since no
+      // outgoing trace will use it meaningfully.
+      const fallback: SurfacePoint =
+        w < inputNV
+          ? { kind: 'vertex', vertex: w }
+          : this.insertedVertexLocations.get(w)!;
+      this.insertedVertexLocations.set(newVertex, fallback);
+      this.insertedVertexAngleOffsets.set(newVertex, 0);
+      return;
+    }
+
+    // Re-derive `newV`'s barycentric location and the trace's arrival
+    // direction *canonically* in the landing face's `faceHalfedge` layout
+    // (the convention `tracePolylineFromSurfacePoint` uses on the way out),
+    // by projecting the final 3D points into that face. Robust regardless of
+    // whether the trace crossed any input edges.
+    const face = finalState.face;
+    const end3D = poly[poly.length - 1]!;
+    const prev3D = poly[poly.length - 2]!;
+    const { bary, dir2D } = this.projectIntoFaceLayout(face, end3D, prev3D);
+
+    const loc: SurfacePoint = { kind: 'face', face, bary: [bary[0], bary[1], bary[2]] };
+
+    // Angle offset δ ties the intrinsic signpost frame at `newV` to the input
+    // face frame: the reference halfedge (newV → w) points opposite the
+    // arrival direction.
+    const offsetP = this.faceLayoutOffset(face, bary);
+    const refFaceFrame = Math.atan2(-dir2D[1], -dir2D[0]);
+    const rescaledRef =
+      this.halfedgeSignposts[heN2W]! / this.vertexAngleScaling(newVertex);
+    const delta = refFaceFrame - offsetP - rescaledRef;
+
+    this.insertedVertexLocations.set(newVertex, loc);
+    this.insertedVertexAngleOffsets.set(newVertex, delta);
   }
 
   /**
-   * Compute a `SurfacePoint` on the input mesh for an edge-interior
-   * insertion. Same caveat as `locateInsertedVertex_face`.
+   * Project a 3D point lying on input face `face` (and a 3D direction along
+   * the geodesic into it) into the face's canonical 2D `faceHalfedge` layout.
+   * Returns the point's barycentric coordinates (in `faceHalfedge` corner
+   * order) and the direction as a 2D vector in that layout. Used by
+   * {@link resolveNewVertex} to obtain frame-consistent quantities.
    */
-  private locateInsertedVertex_edge(e: number, t: number): SurfacePoint {
-    const inputMesh = this.inputGeometry.mesh;
-    if (e < inputMesh.nEdges) {
-      // Same alignment assumption: edge `e` in the intrinsic mesh
-      // corresponds to edge `e` in the input mesh (true if no flips).
-      const im = this.intrinsicMesh;
-      const heIm = im.edgeHalfedge(e);
-      const heIn = inputMesh.edgeHalfedge(e);
-      if (
-        im.vertex(heIm) === inputMesh.vertex(heIn) &&
-        im.tipVertex(heIm) === inputMesh.tipVertex(heIn)
-      ) {
-        return { kind: 'edge', edge: e, t };
-      }
-      // Reversed orientation — flip t.
-      if (
-        im.vertex(heIm) === inputMesh.tipVertex(heIn) &&
-        im.tipVertex(heIm) === inputMesh.vertex(heIn)
-      ) {
-        return { kind: 'edge', edge: e, t: 1 - t };
-      }
+  private projectIntoFaceLayout(
+    face: number,
+    point3D: Vec3,
+    from3D: Vec3,
+  ): { bary: Vec3; dir2D: Vec2 } {
+    const m = this.inputGeometry.mesh;
+    const heA = m.faceHalfedge(face);
+    const heB = m.next(heA);
+    const heC = m.next(heB);
+    const A = this.inputGeometry.position(m.vertex(heA));
+    const B = this.inputGeometry.position(m.vertex(heB));
+    const C = this.inputGeometry.position(m.vertex(heC));
+
+    const v0: Vec3 = [B[0] - A[0], B[1] - A[1], B[2] - A[2]]; // A→B
+    const v1: Vec3 = [C[0] - A[0], C[1] - A[1], C[2] - A[2]]; // A→C
+    const dot = (a: Vec3, b: Vec3): number => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    const d00 = dot(v0, v0);
+    const d01 = dot(v0, v1);
+    const d11 = dot(v1, v1);
+    const denom = d00 * d11 - d01 * d01;
+
+    // Barycentric of `point3D` (corner order A, B, C). The shared L0 helper
+    // carries a degenerate-face guard the inline `denom` math below lacks.
+    const bary = cartesianToBarycentric(point3D, A, B, C);
+
+    // 2D layout (same isometric embedding as faceLayoutOffset).
+    const lAB = this.inputGeometry.halfedgeLength(heA);
+    const lBC = this.inputGeometry.halfedgeLength(heB);
+    const lCA = this.inputGeometry.halfedgeLength(heC);
+    const p2A: Vec2 = [0, 0];
+    const p2B: Vec2 = [lAB, 0];
+    const p2C = layoutTriangleVertex(p2A, p2B, lBC, lCA);
+
+    // Direction `from3D → point3D` expressed in the (v0, v1) basis, then
+    // mapped through the same basis to 2D.
+    const d3: Vec3 = [
+      point3D[0] - from3D[0],
+      point3D[1] - from3D[1],
+      point3D[2] - from3D[2],
+    ];
+    const dq0 = dot(d3, v0);
+    const dq1 = dot(d3, v1);
+    const a2 = (d11 * dq0 - d01 * dq1) / denom; // coeff on v0 / (A→B)
+    const b2 = (d00 * dq1 - d01 * dq0) / denom; // coeff on v1 / (A→C)
+    const dir2D: Vec2 = [a2 * p2B[0] + b2 * p2C[0], a2 * p2B[1] + b2 * p2C[1]];
+
+    return { bary, dir2D };
+  }
+
+  /**
+   * The `tangentAngle` to feed {@link tracePolylineFromSurfacePoint} when
+   * tracing the geodesic along outgoing halfedge `he` whose tail is an
+   * inserted vertex. Combines the halfedge's rescaled signpost with the
+   * per-vertex frame offset `δ` recorded by {@link resolveNewVertex}.
+   */
+  insertedTraceAngle(he: number): number {
+    const v = this.intrinsicMesh.vertex(he);
+    const delta = this.insertedVertexAngleOffsets.get(v);
+    if (delta === undefined) {
+      throw new Error(`insertedTraceAngle: vertex ${v} has no recorded frame`);
     }
-    return { kind: 'edge', edge: e, t };
+    return this.halfedgeSignposts[he]! / this.vertexAngleScaling(v) + delta;
+  }
+
+  /**
+   * Layout offset `atan2(-p.y, -p.x)` for a face-interior point, matching the
+   * `tracePolylineFromSurfacePoint` face-start convention (face laid out with
+   * its `faceHalfedge` along +x). Adding this to a stored `tangentAngle`
+   * yields the absolute direction in the face's 2D frame.
+   */
+  private faceLayoutOffset(face: number, bary: Vec3): number {
+    const m = this.inputGeometry.mesh;
+    const heA = m.faceHalfedge(face);
+    const heB = m.next(heA);
+    const heC = m.next(heB);
+    const lAB = this.inputGeometry.halfedgeLength(heA);
+    const lBC = this.inputGeometry.halfedgeLength(heB);
+    const lCA = this.inputGeometry.halfedgeLength(heC);
+    const pA: Vec2 = [0, 0];
+    const pB: Vec2 = [lAB, 0];
+    const pC = layoutTriangleVertex(pA, pB, lBC, lCA);
+    const px = bary[0] * pA[0] + bary[1] * pB[0] + bary[2] * pC[0];
+    const py = bary[0] * pA[1] + bary[1] * pB[1] + bary[2] * pC[1];
+    return Math.atan2(-py, -px);
   }
 
   /**
@@ -1139,31 +1313,6 @@ export class SignpostIntrinsicTriangulation {
    * just the endpoint. Added here (rather than at L4) so the 2D-layout
    * machinery and tolerance constants stay encapsulated.
    */
-  /**
-   * Single-shot trace from a `SurfacePoint` start: walk `dist` along the
-   * input mesh in tangent direction `tangentAngle` and return only the
-   * destination as a {@link TraceResult}. Used by chained polyline
-   * extraction (e.g. `extractPolyline` over bezier-subdivided paths) to
-   * obtain the SurfacePoint at each segment's terminus without paying for
-   * a full polyline allocation.
-   */
-  traceFromSurfacePoint(
-    start: SurfacePoint,
-    tangentAngle: number,
-    distance: number,
-  ): TraceResult {
-    if (start.kind === 'vertex') {
-      return this.traceFromVertex(start.vertex, tangentAngle, distance);
-    }
-    const finalState = { face: -1, bary: [0, 0, 0] as Vec3 };
-    const poly = this.tracePolylineFromSurfacePoint(start, tangentAngle, distance, finalState);
-    return {
-      position: poly[poly.length - 1] ?? this.surfacePointPosition(start),
-      faceIndex: finalState.face,
-      barycentric: finalState.bary,
-    };
-  }
-
   tracePolylineFromVertex(
     v: number,
     tangentAngle: number,

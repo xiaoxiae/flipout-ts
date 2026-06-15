@@ -402,9 +402,26 @@ describe('insertVertex_edge — surface-point bookkeeping', () => {
   it('records inserted vertex location for edge insertions', () => {
     const { sit } = build(cube());
     const e = findInteriorEdge(sit);
-    const newV = sit.insertVertex_edge(e, 0.4);
+    // Capture the edge endpoints before the split so we can predict where the
+    // t = 0.4 point lands in 3D. `resolveNewVertex` records the location by
+    // tracing along the input mesh, so the stored `SurfacePoint` is a face
+    // point lying on the edge (not necessarily an 'edge'-kind point) — assert
+    // the resolved 3D position instead of the representation.
+    const im = sit.intrinsicMesh;
+    const he = im.edgeHalfedge(e);
+    const a = sit.inputGeometry.position(im.vertex(he));
+    const b = sit.inputGeometry.position(im.tipVertex(he));
+    const t = 0.4;
+    const expected = [
+      (1 - t) * a[0] + t * b[0],
+      (1 - t) * a[1] + t * b[1],
+      (1 - t) * a[2] + t * b[2],
+    ];
+
+    const newV = sit.insertVertex_edge(e, t);
     const loc = sit.insertedVertexLocations.get(newV);
     expect(loc).toBeDefined();
-    expect(loc!.kind).toBe('edge');
+    const pos = sit.surfacePointPosition(loc!);
+    for (let i = 0; i < 3; i++) expect(pos[i]).toBeCloseTo(expected[i]!, 9);
   });
 });

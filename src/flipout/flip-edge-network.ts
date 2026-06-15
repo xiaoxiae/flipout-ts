@@ -125,6 +125,19 @@ class WedgeHeap {
 }
 
 /**
+ * Thrown by {@link FlipEdgeNetwork.bezierSubdivide} when the path is not
+ * simple at a control vertex (the curve passes through a vertex more than
+ * once). gc has the same precondition. Callers that want to fall back to a
+ * piecewise scheme should catch this rather than matching on the message text.
+ */
+export class BezierNonSimpleError extends Error {
+  constructor(message = 'bezierSubdivide: multiple paths at vertex') {
+    super(message);
+    this.name = 'BezierNonSimpleError';
+  }
+}
+
+/**
  * FlipOut implementation. Holds an intrinsic triangulation and a path on it
  * (here we support a single open path — the common shortest-path case). Use
  * {@link flipOut} to drive the path to a geodesic.
@@ -974,7 +987,7 @@ export class FlipEdgeNetwork {
     while (id !== -1) {
       const seg = this.segments.get(id)!;
       if (im.vertex(seg.he) === v) {
-        if (found !== -1) throw new Error('bezierSubdivide: multiple paths at vertex');
+        if (found !== -1) throw new BezierNonSimpleError();
         found = id;
       }
       id = seg.nextId;
@@ -990,7 +1003,7 @@ export class FlipEdgeNetwork {
     while (id !== -1) {
       const seg = this.segments.get(id)!;
       if (im.tipVertex(seg.he) === v) {
-        if (found !== -1) throw new Error('bezierSubdivide: multiple paths at vertex');
+        if (found !== -1) throw new BezierNonSimpleError();
         found = id;
       }
       id = seg.nextId;
@@ -1073,68 +1086,52 @@ export class FlipEdgeNetwork {
   // ============================================================================
 
   /**
-   * Extract a 3D polyline by tracing each path segment across the input
-   * mesh and concatenating the per-segment polylines (de-duplicating
-   * shared endpoints).
+   * Extract a 3D polyline by tracing each path segment independently across
+   * the input mesh and concatenating the per-segment polylines (de-duplicating
+   * shared endpoints). Mirrors gc's `getPathPolyline` /
+   * `traceIntrinsicHalfedgeAlongInput`.
    *
-   * Each segment is traced INDEPENDENTLY from whichever endpoint is
-   * easier — original vertex preferred, otherwise via `tracePolylineFromVertex`
-   * starting from a known anchor. For path segments with both endpoints
-   * inserted (which can happen during `bezierSubdivide` when consecutive
-   * midpoints sit on a single intrinsic-only edge), we trace from the
-   * tail's stored `insertedVertexLocations` SurfacePoint via
-   * `tracePolylineFromSurfacePoint`. Note: when an insertion target was on
-   * an intrinsic-only edge, the stored SurfacePoint's edge id is bogus
-   * (it references the intrinsic edge, not an input edge), so the
-   * resulting polyline can drift; bezier curves with deep subdivision
-   * may show visible deviation. Demo-quality but not production-quality.
+   * Each segment's intrinsic halfedge is traced from its TAIL's input-mesh
+   * location, in the tail's input tangent frame, for the segment's intrinsic
+   * length:
+   *
+   *   - Original input vertices trace from the vertex itself; the rescaled
+   *     signpost is already an input tangent angle.
+   *   - Vertices inserted during FlipOut / bezier subdivision trace from the
+   *     `SurfacePoint` resolved by `resolveNewVertex`, using the per-vertex
+   *     frame offset via `insertedTraceAngle` (the raw signpost frame is not
+   *     input-aligned once the mesh has been flipped).
+   *
+   * Because every vertex carries a correct input-mesh location, segments with
+   * both endpoints inserted (which arise during deep bezier subdivision) trace
+   * just like any other — no straight-chord fallback is needed.
    */
   extractPolyline(): Vec3[] {
+    const im = this.intrinsic.intrinsicMesh;
+    const inputNV = this.intrinsic.inputGeometry.mesh.nVertices;
+
     const parts: Vec3[][] = [];
     for (const seg of this.iterPath()) {
-      parts.push(traceSegmentPolylineAuto(this.intrinsic, seg.he));
+      const he = seg.he;
+      const tail = im.vertex(he);
+      const len = this.intrinsic.edgeLengths[im.edge(he)]!;
+
+      if (tail < inputNV) {
+        const angle =
+          this.intrinsic.halfedgeSignposts[he]! /
+          this.intrinsic.vertexAngleScaling(tail);
+        parts.push(this.intrinsic.tracePolylineFromVertex(tail, angle, len));
+      } else {
+        const loc = this.intrinsic.insertedVertexLocations.get(tail);
+        if (loc === undefined) {
+          throw new Error(`extractPolyline: inserted vertex ${tail} has no input location`);
+        }
+        const angle = this.intrinsic.insertedTraceAngle(he);
+        parts.push(this.intrinsic.tracePolylineFromSurfacePoint(loc, angle, len));
+      }
     }
     return concatPolylines(parts);
   }
-}
-
-function traceSegmentPolylineAuto(
-  intrinsic: SignpostIntrinsicTriangulation,
-  segHe: number,
-): Vec3[] {
-  const im = intrinsic.intrinsicMesh;
-  const tail = im.vertex(segHe);
-  const tip = im.tipVertex(segHe);
-  const inputNV = intrinsic.inputGeometry.mesh.nVertices;
-  const tailIsOriginal = tail < inputNV;
-  const tipIsOriginal = tip < inputNV;
-  const len = intrinsic.edgeLengths[im.edge(segHe)]!;
-
-  if (tailIsOriginal) {
-    const rawAngle = intrinsic.halfedgeSignposts[segHe]!;
-    const rescaled = rawAngle / intrinsic.vertexAngleScaling(tail);
-    return intrinsic.tracePolylineFromVertex(tail, rescaled, len);
-  }
-
-  if (tipIsOriginal) {
-    // Trace backward from original tip via the twin halfedge.
-    const heTwin = im.twin(segHe);
-    const rawAngle = intrinsic.halfedgeSignposts[heTwin]!;
-    const rescaled = rawAngle / intrinsic.vertexAngleScaling(tip);
-    const out = intrinsic.tracePolylineFromVertex(tip, rescaled, len);
-    out.reverse();
-    return out;
-  }
-
-  // Both endpoints inserted by `bezierSubdivide`. Their stored
-  // `insertedVertexLocations` SurfacePoints reference INTRINSIC edges that
-  // may not exist in the input mesh (the intrinsic edge was created by an
-  // earlier flip). Tracing from such a SurfacePoint throws — return an
-  // empty polyline so the caller can stitch the gap with a straight
-  // approximation. A correct implementation would port gc's
-  // `resolveNewVertex` to compute proper input-mesh SurfacePoints at
-  // insertion time; for the demo we accept these gaps.
-  return [];
 }
 
 /**
@@ -1281,9 +1278,8 @@ function traceSegmentPolyline(
     const pb = tipLoc ? intrinsic.surfacePointPosition(tipLoc) : [0, 0, 0];
     return [pa as Vec3, pb as Vec3];
   }
-  const rawAngle = intrinsic.halfedgeSignposts[segHe]!;
-  const rescaled = rawAngle / intrinsic.vertexAngleScaling(tail);
-  const out = intrinsic.tracePolylineFromSurfacePoint(tailLoc, rescaled, len);
+  const angle = intrinsic.insertedTraceAngle(segHe);
+  const out = intrinsic.tracePolylineFromSurfacePoint(tailLoc, angle, len);
   if (out.length > 0) out[0] = intrinsic.surfacePointPosition(tailLoc);
   if (out.length > 1) out[out.length - 1] = intrinsic.surfacePointPosition(tipLoc);
   return out;
@@ -1436,4 +1432,37 @@ export function flipEdgeNetworkFromControlPath(
     for (const v of controlVertices) net.setMarkedVertex(v, true);
   }
   return net;
+}
+
+/**
+ * Like {@link flipEdgeNetworkFromControlPath} but accepts arbitrary
+ * {@link SurfacePoint}s (vertex / edge / face) as control points. Each
+ * non-vertex point is inserted into the intrinsic triangulation as a new
+ * vertex (via the same `resolveSurfacePoint` path as
+ * {@link flipOutPathFromSurfacePoints}); consecutive points that resolve to
+ * the same vertex (e.g. two clicks that snap together) are collapsed.
+ *
+ * Mutates the intrinsic triangulation by inserting vertices — build a fresh
+ * `SignpostIntrinsicTriangulation` per query. Returns `null` if fewer than two
+ * distinct control vertices remain or a Dijkstra segment is disconnected.
+ */
+export function flipEdgeNetworkFromSurfacePointControlPath(
+  intrinsic: SignpostIntrinsicTriangulation,
+  controlPoints: readonly SurfacePoint[],
+  options: { markInterior?: boolean } = {},
+): FlipEdgeNetwork | null {
+  if (controlPoints.length < 2) {
+    throw new Error(
+      `flipEdgeNetworkFromSurfacePointControlPath: need ≥2 control points, got ${controlPoints.length}`,
+    );
+  }
+  const controlVertices: number[] = [];
+  for (const p of controlPoints) {
+    const v = resolveSurfacePoint(intrinsic, p);
+    if (controlVertices.length === 0 || controlVertices[controlVertices.length - 1] !== v) {
+      controlVertices.push(v);
+    }
+  }
+  if (controlVertices.length < 2) return null;
+  return flipEdgeNetworkFromControlPath(intrinsic, controlVertices, options);
 }
