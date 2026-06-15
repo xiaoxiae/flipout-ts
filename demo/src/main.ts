@@ -19,7 +19,8 @@ import {
 import type { SurfacePoint } from 'flipout-ts';
 import {
   flipOutPathFromSurfacePoints,
-  flipEdgeNetworkFromControlPath,
+  geodesicSpline,
+  type GeodesicSplineType,
 } from 'flipout-ts/flipout';
 import { meshFromBufferGeometry, pathToBufferGeometry } from 'flipout-ts/three';
 
@@ -251,9 +252,10 @@ let dstWorld: [number, number, number] | null = null;
 // Bezier mode state. Mode toggle decides which click flow runs.
 type Mode = 'geodesic' | 'bezier';
 let mode: Mode = 'geodesic';
-const bezierControls: number[] = []; // intrinsic vertex indices (= input vertex)
+const bezierControls: PickResult[] = []; // arbitrary surface points (vertex/edge/face)
 const bezierMarkers: THREE.Mesh[] = [];
 let bezierRounds = 1;
+let bezierCurveType: GeodesicSplineType = 'catmull-rom';
 let bezierLine: THREE.Line | null = null;
 let bezierPathPoints: THREE.Points | null = null;
 
@@ -267,10 +269,11 @@ const objInput = document.getElementById('obj-input') as HTMLInputElement;
 const wireframeChk = document.getElementById('wireframe') as HTMLInputElement;
 const pathPointsChk = document.getElementById('path-points') as HTMLInputElement;
 const animateBtn = document.getElementById('animate') as HTMLButtonElement;
+const randomBtn = document.getElementById('random') as HTMLButtonElement;
 const bezierRow = document.getElementById('bezier-row') as HTMLDivElement;
 const roundsInput = document.getElementById('rounds') as HTMLInputElement;
 const roundsVal = document.getElementById('rounds-val') as HTMLSpanElement;
-const bezierComputeBtn = document.getElementById('bezier-compute') as HTMLButtonElement;
+const curveTypeSel = document.getElementById('curve-type') as HTMLSelectElement;
 
 // Animation state. `lastResultIters` is set to `result.iterations` after
 // every successful runFlipOut; the Animate button uses it as the upper
@@ -298,6 +301,20 @@ function disposeAllGhosts(): void {
     g.mat.dispose();
   }
   ghostLines.length = 0;
+}
+
+/** Decay all ghost lines one step; remove any that have faded out. */
+function fadeGhosts(): void {
+  for (let i = ghostLines.length - 1; i >= 0; i--) {
+    const g = ghostLines[i]!;
+    g.mat.opacity = Math.max(0, g.mat.opacity - GHOST_INITIAL_OPACITY / GHOST_FADE_STEPS);
+    if (g.mat.opacity <= 0.001) {
+      scene.remove(g.line);
+      g.line.geometry.dispose();
+      g.mat.dispose();
+      ghostLines.splice(i, 1);
+    }
+  }
 }
 
 /**
@@ -334,8 +351,9 @@ roundsInput.addEventListener('input', () => {
   }
 });
 
-bezierComputeBtn.addEventListener('click', () => {
-  runBezier();
+curveTypeSel.addEventListener('change', () => {
+  bezierCurveType = curveTypeSel.value as GeodesicSplineType;
+  if (bezierControls.length >= 2) runBezier();
 });
 
 objButton.addEventListener('click', () => {
@@ -372,7 +390,13 @@ pathPointsChk.addEventListener('change', () => {
 });
 
 animateBtn.addEventListener('click', () => {
-  void animateIterations();
+  if (mode === 'bezier') void animateBezierRounds();
+  else void animateIterations();
+});
+
+randomBtn.addEventListener('click', () => {
+  if (mode === 'bezier') pickRandomControlPoints();
+  else pickRandomEndpoints();
 });
 
 /**
@@ -506,16 +530,112 @@ async function animateIterations(): Promise<void> {
   }
 }
 
+/**
+ * Animate the curve through subdivision rounds 0,1,…,N: the de Casteljau
+ * geodesic Bezier (or Catmull-Rom piece subdivision) refines from the coarse
+ * control polygon to the smooth final curve, with a fading ghost trail —
+ * the curve-mode analog of the geodesic straightening animation.
+ */
+async function animateBezierRounds(): Promise<void> {
+  if (surfaceMesh === null || surfacePositions === null) return;
+  if (bezierControls.length < 2) return;
+
+  const token = ++animationToken;
+  setControlsEnabled(false);
+
+  // Demote the current finalized curve to a ghost so it fades as round 0 arrives.
+  if (bezierLine !== null) {
+    demoteToGhost(bezierLine);
+    ghostLines.push({ line: bezierLine, mat: bezierLine.material as THREE.LineBasicMaterial });
+    bezierLine = null;
+  }
+
+  const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+  const geom = new VertexPositionGeometry(surfaceMesh, surfacePositions);
+  const points = bezierControls.map((c) => c.point);
+  const label = curveLabel(bezierCurveType);
+  let lastLen = 0;
+
+  for (let k = 0; k <= bezierRounds; k++) {
+    if (token !== animationToken) return;
+    let result;
+    try {
+      result = geodesicSpline(geom, points, { type: bezierCurveType, rounds: k });
+    } catch (err) {
+      setStatus(`Animation aborted at round ${k}: ${err instanceof Error ? err.message : String(err)}`);
+      setControlsEnabled(true);
+      return;
+    }
+    if (token !== animationToken) return;
+    if (result.polyline.length < 2) continue;
+    lastLen = result.length;
+
+    // Demote previous active line into the ghost trail, fade older ghosts.
+    if (bezierLine !== null) {
+      demoteToGhost(bezierLine);
+      ghostLines.push({ line: bezierLine, mat: bezierLine.material as THREE.LineBasicMaterial });
+      bezierLine = null;
+    }
+    fadeGhosts();
+
+    // Draw this round's curve as the active (bright, full-opacity) line.
+    const lineGeom = pathToBufferGeometry(result.polyline);
+    const lineMat = new THREE.LineBasicMaterial({
+      color: ACTIVE_LINE_COLOR,
+      depthTest: false,
+      transparent: true,
+      opacity: 1.0,
+      linewidth: 2,
+    });
+    bezierLine = new THREE.Line(lineGeom, lineMat);
+    bezierLine.renderOrder = 1;
+    scene.add(bezierLine);
+
+    if (bezierPathPoints !== null) {
+      const flat = new Float32Array(result.polyline.length * 3);
+      for (let i = 0; i < result.polyline.length; i++) {
+        flat[i * 3 + 0] = result.polyline[i]![0];
+        flat[i * 3 + 1] = result.polyline[i]![1];
+        flat[i * 3 + 2] = result.polyline[i]![2];
+      }
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(flat, 3));
+      bezierPathPoints.geometry.dispose();
+      bezierPathPoints.geometry = g;
+    }
+
+    setStatus(`Animating ${label} — round ${k} / ${bezierRounds} (length=${result.length.toFixed(4)})`);
+    await sleep(ANIMATE_STEP_MS);
+  }
+  if (token !== animationToken) return;
+
+  disposeAllGhosts();
+  setControlsEnabled(true);
+  setStatus(`${label} length: ${lastLen.toFixed(4)} (${bezierControls.length} ctrls, ${bezierRounds} rounds).`);
+}
+
+/** Whether there's something to animate in the current mode. */
+function canAnimate(): boolean {
+  return mode === 'geodesic'
+    ? lastResultIters !== null
+    : bezierControls.length >= 2 && bezierLine !== null;
+}
+
 function setControlsEnabled(enabled: boolean): void {
   meshSel.disabled = !enabled;
   objButton.disabled = !enabled;
   // Reset stays enabled so the user can cancel mid-animation.
   // animateBtn is special: only enabled when there's a path AND not animating.
-  animateBtn.disabled = !enabled || lastResultIters === null;
+  animateBtn.disabled = !enabled || !canAnimate();
+  randomBtn.disabled = !enabled;
 }
 
 function setStatus(msg: string): void {
   statusEl.textContent = msg;
+}
+
+function curveLabel(t: GeodesicSplineType): string {
+  return t === 'catmull-rom' ? 'Catmull-Rom' : t === 'bspline' ? 'B-spline' : 'Bezier';
 }
 
 // ---------------------------------------------------------------------------
@@ -582,13 +702,12 @@ function clearBezierState(): void {
   bezierLine = null;
   disposeObject3D(bezierPathPoints);
   bezierPathPoints = null;
-  bezierComputeBtn.disabled = true;
 }
 
 function modeStatusInitial(): string {
   return mode === 'geodesic'
     ? 'Click to set source.'
-    : 'Click to add a control vertex (need ≥ 2).';
+    : 'Click anywhere on the mesh to add control points (need ≥ 2); curve updates live.';
 }
 
 function setMode(m: Mode): void {
@@ -599,7 +718,8 @@ function setMode(m: Mode): void {
   titleEl.textContent =
     mode === 'geodesic'
       ? 'FlipOut geodesic demo — click two points on the mesh'
-      : 'FlipOut bezier demo — click 3+ control vertices, then Compute';
+      : 'FlipOut spline demo — click control points anywhere; curve updates live';
+  randomBtn.disabled = false;
   setStatus(modeStatusInitial());
 }
 
@@ -700,6 +820,103 @@ function pickSurfacePoint(clientX: number, clientY: number): PickResult | null {
   };
 }
 
+/**
+ * Sample a uniformly-random `face`-kind surface point: pick a random face
+ * and uniform barycentric coordinates inside it (sqrt-remap so the sample
+ * is uniform over the triangle, not biased to one corner). Returns the
+ * `SurfacePoint` plus its 3D world position.
+ */
+function randomFaceSurfacePoint(): PickResult | null {
+  if (surfaceMesh === null || surfacePositions === null) return null;
+  const f = Math.floor(Math.random() * surfaceMesh.nFaces);
+  const it = surfaceMesh.verticesOfFace(f);
+  const v0 = it.next().value as number;
+  const v1 = it.next().value as number;
+  const v2 = it.next().value as number;
+  const r1 = Math.random();
+  const r2 = Math.random();
+  const s = Math.sqrt(r1);
+  const b0 = 1 - s;
+  const b1 = s * (1 - r2);
+  const b2 = s * r2;
+  const p0 = surfacePositions[v0]!;
+  const p1 = surfacePositions[v1]!;
+  const p2 = surfacePositions[v2]!;
+  const worldPos: [number, number, number] = [
+    b0 * p0[0] + b1 * p1[0] + b2 * p2[0],
+    b0 * p0[1] + b1 * p1[1] + b2 * p2[1],
+    b0 * p0[2] + b1 * p1[2] + b2 * p2[2],
+  ];
+  return {
+    point: { kind: 'face', face: f, bary: [b0, b1, b2] },
+    worldPos,
+  };
+}
+
+/**
+ * Reset state and pick two uniformly-random points on the mesh as
+ * source / destination, then run flipout. No-op in bezier mode.
+ */
+function pickRandomEndpoints(): void {
+  if (mode !== 'geodesic') return;
+  if (surfaceMesh === null || surfacePositions === null) return;
+
+  clearAll();
+
+  const src = randomFaceSurfacePoint();
+  if (src === null) return;
+  let dst = randomFaceSurfacePoint();
+  // Guard against the (extremely unlikely) case of identical samples.
+  for (let tries = 0; tries < 8 && dst !== null && pointsEqual(src.point, dst.point); tries++) {
+    dst = randomFaceSurfacePoint();
+  }
+  if (dst === null) return;
+
+  srcPoint = src.point;
+  srcWorld = src.worldPos;
+  srcMarker = makeMarker(0x55ff77);
+  srcMarker.position.set(src.worldPos[0], src.worldPos[1], src.worldPos[2]);
+  scene.add(srcMarker);
+
+  dstPoint = dst.point;
+  dstWorld = dst.worldPos;
+  dstMarker = makeMarker(0xff77aa);
+  dstMarker.position.set(dst.worldPos[0], dst.worldPos[1], dst.worldPos[2]);
+  scene.add(dstMarker);
+
+  runFlipOut();
+  state = 'done';
+}
+
+/**
+ * Reset spline state and pick a few uniformly-random control points on the
+ * mesh, then compute the curve. Spline-mode counterpart to
+ * {@link pickRandomEndpoints}.
+ */
+function pickRandomControlPoints(): void {
+  if (mode !== 'bezier') return;
+  if (surfaceMesh === null || surfacePositions === null) return;
+
+  clearBezierState();
+
+  const k = 3 + Math.floor(Math.random() * 3); // 3..5 control points
+  for (let i = 0; i < k; i++) {
+    let pick = randomFaceSurfacePoint();
+    const last = bezierControls[bezierControls.length - 1];
+    // Avoid placing a control on top of the previous one.
+    for (let tries = 0; tries < 8 && pick !== null && last !== undefined && pointsEqual(last.point, pick.point); tries++) {
+      pick = randomFaceSurfacePoint();
+    }
+    if (pick === null) continue;
+    bezierControls.push(pick);
+    const marker = makeMarker(BEZIER_COLORS[(bezierControls.length - 1) % BEZIER_COLORS.length]!);
+    marker.position.set(pick.worldPos[0], pick.worldPos[1], pick.worldPos[2]);
+    scene.add(marker);
+    bezierMarkers.push(marker);
+  }
+  if (bezierControls.length >= 2) runBezier();
+}
+
 // We want pick-on-click but not on drag. Track pointerdown position; only
 // treat the release as a "click" if movement was small.
 let downX = 0;
@@ -787,59 +1004,34 @@ function handleClick(clientX: number, clientY: number): void {
 }
 
 /**
- * Bezier click flow: each click adds a vertex-kind control point. Picks
- * that don't snap-to-vertex naturally are coerced to the closest face
- * corner, since `flipEdgeNetworkFromControlPath` requires vertex indices.
- * Once ≥2 control points are placed, `Compute` is enabled.
+ * Bezier click flow: each click adds a control point anywhere on the surface
+ * (face / edge / vertex — not just mesh vertices). Once ≥2 control points are
+ * placed, the curve recomputes live on every click.
  */
 function handleBezierClick(clientX: number, clientY: number): void {
   const pick = pickSurfacePoint(clientX, clientY);
   if (pick === null) return;
-  const v = pickToVertex(pick);
-  if (v === null) return;
-  if (bezierControls.length > 0 && bezierControls[bezierControls.length - 1] === v) {
-    setStatus(`Already added vertex ${v}. Pick a different one.`);
+  const last = bezierControls[bezierControls.length - 1];
+  if (last !== undefined && pointsEqual(last.point, pick.point)) {
+    setStatus('Picked the same point — try somewhere else.');
     return;
   }
-  bezierControls.push(v);
-  const pos = surfacePositions![v]!;
+  bezierControls.push(pick);
   const marker = makeMarker(BEZIER_COLORS[(bezierControls.length - 1) % BEZIER_COLORS.length]!);
-  marker.position.set(pos[0], pos[1], pos[2]);
+  marker.position.set(pick.worldPos[0], pick.worldPos[1], pick.worldPos[2]);
   scene.add(marker);
   bezierMarkers.push(marker);
-  bezierComputeBtn.disabled = bezierControls.length < 2;
-  setStatus(
-    `Control points: ${bezierControls.length}. ${
-      bezierControls.length < 2
-        ? 'Add at least one more.'
-        : 'Click Compute (or add more, then Compute).'
-    }`,
-  );
+
+  if (bezierControls.length >= 2) {
+    runBezier();
+  } else {
+    setStatus('Control points: 1. Add at least one more.');
+  }
 }
 
 const BEZIER_COLORS = [
   0x55ff77, 0xff77aa, 0x77aaff, 0xffd060, 0xaa77ff, 0x77ffd0,
 ];
-
-function pickToVertex(p: PickResult): number | null {
-  const sp = p.point;
-  if (sp.kind === 'vertex') return sp.vertex;
-  if (surfaceMesh === null) return null;
-  // For face / edge picks, snap to the closest face corner via barycentric.
-  if (sp.kind === 'face') {
-    const [b0, b1, b2] = sp.bary;
-    const it = surfaceMesh.verticesOfFace(sp.face);
-    const v0 = it.next().value as number;
-    const v1 = it.next().value as number;
-    const v2 = it.next().value as number;
-    if (b0 >= b1 && b0 >= b2) return v0;
-    if (b1 >= b0 && b1 >= b2) return v1;
-    return v2;
-  }
-  // 'edge': snap to the closer endpoint by t.
-  const he = surfaceMesh.edgeHalfedge(sp.edge);
-  return sp.t < 0.5 ? surfaceMesh.vertex(he) : surfaceMesh.tipVertex(he);
-}
 
 // ---------------------------------------------------------------------------
 // Run handler
@@ -913,59 +1105,49 @@ function runFlipOut(): void {
 }
 
 /**
- * Bezier compute: build a network from the user-picked control vertices,
- * run `bezierSubdivide` for the chosen number of rounds, and draw the
- * resulting curve via `extractPolyline`.
- *
- * Caveat: for paths with both endpoints inserted by subdivision (which
- * happens at deep subdivision on near-degenerate geometries), the
- * polyline tracer can't reconstruct the 3D position from gc-style
- * SurfacePoints — those segments come back as straight chords through
- * the surface. Visible at `Subdivisions ≥ 2` on the teapot, less so on
- * round meshes (icosphere). See `extractPolyline` in `flip-edge-network.ts`.
+ * Compute the curve through the user-picked control points and draw it, using
+ * the selected geodesic spline scheme (`bezier` or `catmull-rom`). The library
+ * handles the global→piecewise fallback and per-piece robustness.
  */
 function runBezier(): void {
   if (surfaceMesh === null || surfacePositions === null) return;
   if (bezierControls.length < 2) {
-    setStatus('Need ≥ 2 control vertices.');
+    setStatus('Need ≥ 2 control points.');
     return;
   }
 
-  // Tear down a previous bezier line if present.
+  // Tear down a previous curve if present.
   disposeObject3D(bezierLine);
   bezierLine = null;
   disposeObject3D(bezierPathPoints);
   bezierPathPoints = null;
 
-  setStatus(
-    `Computing bezier through ${bezierControls.length} control vertices, ${bezierRounds} rounds...`,
-  );
-
   let polyline: readonly (readonly [number, number, number])[];
   let length: number;
+  let info: string;
   let computeMs = 0;
   try {
     const t0 = performance.now();
     const geom = new VertexPositionGeometry(surfaceMesh, surfacePositions);
-    const intrinsic = new SignpostIntrinsicTriangulation(geom);
-    const net = flipEdgeNetworkFromControlPath(intrinsic, bezierControls, {
-      markInterior: true,
+    const result = geodesicSpline(geom, bezierControls.map((c) => c.point), {
+      type: bezierCurveType,
+      rounds: bezierRounds,
     });
-    if (net === null) {
-      setStatus('Bezier setup failed: control vertices not connected by Dijkstra.');
-      return;
-    }
-    net.bezierSubdivide(bezierRounds);
-    polyline = net.extractPolyline();
-    length = net.pathLength();
     computeMs = performance.now() - t0;
+    polyline = result.polyline;
+    length = result.length;
+    info = result.fellBack
+      ? ` — self-intersecting, ${result.pieces}-piece spline`
+      : result.pieces > 1
+        ? ` — ${result.pieces} pieces`
+        : '';
   } catch (err) {
-    setStatus(`Bezier error: ${err instanceof Error ? err.message : String(err)}`);
+    setStatus(`Curve error: ${err instanceof Error ? err.message : String(err)}`);
     return;
   }
 
   if (polyline.length < 2) {
-    setStatus('Bezier produced too few polyline points to render.');
+    setStatus('Curve produced too few polyline points to render.');
     return;
   }
 
@@ -998,10 +1180,13 @@ function runBezier(): void {
   bezierPathPoints.visible = pathPointsChk.checked;
   scene.add(bezierPathPoints);
 
+  const label = curveLabel(bezierCurveType);
   setStatus(
-    `Bezier length: ${length.toFixed(4)} (${bezierControls.length} ctrls, ` +
-      `${bezierRounds} rounds, ${polyline.length} polyline pts, ${computeMs.toFixed(1)} ms).`,
+    `${label} length: ${length.toFixed(4)} (${bezierControls.length} ctrls, ` +
+      `${bezierRounds} rounds, ${polyline.length} pts, ${computeMs.toFixed(1)} ms)${info}.`,
   );
+  // A curve now exists → allow animating its subdivision rounds.
+  animateBtn.disabled = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -1024,6 +1209,25 @@ window.addEventListener('resize', () => {
 // Go
 // ---------------------------------------------------------------------------
 
+/**
+ * Browsers restore form-control values across a refresh, but module-level JS
+ * state re-initialises to its code defaults — leaving the controls and the app
+ * out of sync (e.g. the curve-type dropdown says "B-spline" while the code
+ * still thinks "Catmull-Rom", or the mode select says "spline" while the
+ * spline row stays hidden). Adopt whatever the controls currently show so the
+ * UI and state always agree on load.
+ */
+function syncStateToControls(): void {
+  bezierRounds = Number.parseInt(roundsInput.value, 10) || bezierRounds;
+  roundsVal.textContent = String(bezierRounds);
+  bezierCurveType = curveTypeSel.value as GeodesicSplineType;
+  // setMode shows/hides the spline row + sets the title. `mode` starts at its
+  // 'geodesic' default, whose UI matches the HTML defaults, so this is a no-op
+  // when the restored mode is geodesic and a full switch when it is 'bezier'.
+  setMode(modeSel.value as Mode);
+}
+
+syncStateToControls();
 loadMesh(meshSel.value)
   .then(() => {
     animate();

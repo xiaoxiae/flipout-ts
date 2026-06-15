@@ -62,7 +62,7 @@
       #mode,
       #obj-button,
       #animate,
-      #bezier-compute {
+      #random {
         padding: 6px 12px;
         font-size: 13px;
         background: #2c2c38;
@@ -77,17 +77,17 @@
       #mode:hover,
       #obj-button:hover,
       #animate:hover:not(:disabled),
-      #bezier-compute:hover:not(:disabled) {
+      #random:hover:not(:disabled) {
         background: #3a3a4a;
       }
       #reset:active,
       #obj-button:active,
       #animate:active:not(:disabled),
-      #bezier-compute:active:not(:disabled) {
+      #random:active:not(:disabled) {
         background: #2c2c38;
       }
       #animate:disabled,
-      #bezier-compute:disabled {
+      #random:disabled {
         opacity: 0.4;
         cursor: not-allowed;
       }
@@ -130,7 +130,7 @@
       <div id="controls">
         <select id="mode">
           <option value="geodesic">Mode: geodesic (2 points)</option>
-          <option value="bezier">Mode: bezier (3+ control vertices)</option>
+          <option value="bezier">Mode: spline (2+ control points)</option>
         </select>
         <select id="mesh">
           <option value="teapot">Utah teapot (1601 V)</option>
@@ -142,13 +142,17 @@
         <button id="obj-button" type="button">Load OBJ...</button>
         <input id="obj-input" type="file" accept=".obj" />
         <button id="animate" type="button" disabled>Animate</button>
+        <button id="random" type="button">Random</button>
         <button id="reset">Reset</button>
       </div>
       <div id="bezier-row" style="display: none; margin-top: 6px; align-items: center; gap: 8px; pointer-events: auto; font-size: 13px;">
+        <select id="curve-type">
+          <option value="catmull-rom">Catmull-Rom</option>
+          <option value="bspline">B-spline</option>
+        </select>
         <label for="rounds">Subdivisions:</label>
-        <input id="rounds" type="range" min="0" max="3" step="1" value="1" />
+        <input id="rounds" type="range" min="0" max="4" step="1" value="1" />
         <span id="rounds-val" style="font-variant-numeric: tabular-nums; min-width: 1ch;">1</span>
-        <button id="bezier-compute" type="button" disabled>Compute</button>
       </div>
       <div id="wireframe-row">
         <input id="wireframe" type="checkbox" />
